@@ -290,8 +290,9 @@ async function createOrLinkStaff() {
 
   let uid = existingUid;
   let secondaryApp = null;
+  let isInviteOnly = false;
   try {
-    if (!uid) {
+    if (!uid && password) {
       if (password.length < 6) return toast('নতুন অ্যাকাউন্টের password কমপক্ষে ৬ অক্ষরের দিন।', 'w');
       const appName = 'staff-create-' + Date.now();
       secondaryApp = firebase.apps.find(app => app.name === appName)
@@ -299,20 +300,30 @@ async function createOrLinkStaff() {
       const credential = await secondaryApp.auth().createUserWithEmailAndPassword(email, password);
       uid = credential.user.uid;
       await secondaryApp.auth().signOut();
+    } else if (!uid && !password) {
+      isInviteOnly = true;
     }
-    if (uid === APP_STATE.currentUser?.uid) return toast('নিজের UID স্টাফ হিসেবে যোগ করা যাবে না।', 'e');
-    await fbDb.collection('staff').doc(uid).set({
-      uid, email, displayName: name,
+    if (uid && uid === APP_STATE.currentUser?.uid) return toast('নিজের UID স্টাফ হিসেবে যোগ করা যাবে না।', 'e');
+    const docId = uid || ('INV-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase());
+    await fbDb.collection('staff').doc(docId).set({
+      uid: uid || null,
+      email,
+      displayName: name,
       ownerUid: APP_STATE.currentUser.uid,
       role: role === 'manager' ? 'manager' : 'cashier',
       assignedBranchIds: branchIds,
       permissions,
       active: true,
-      status: 'active',
+      status: isInviteOnly ? 'invited' : 'active',
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
     });
-    toast(existingUid ? 'বিদ্যমান UID স্টাফ হিসেবে যোগ হয়েছে।' : 'স্টাফ Firebase অ্যাকাউন্ট এবং রেকর্ড তৈরি হয়েছে।', 's');
+    toast(
+      isInviteOnly
+        ? 'স্টাফ ইনভাইট তৈরি হয়েছে (প্রথম লগইনে অ্যাকাউন্ট বাইন্ড হবে)।'
+        : (existingUid ? 'বিদ্যমান UID স্টাফ হিসেবে যোগ হয়েছে।' : 'স্টাফ Firebase অ্যাকাউন্ট এবং রেকর্ড তৈরি হয়েছে।'),
+      's'
+    );
     document.getElementById('staff-name').value = '';
     document.getElementById('staff-email').value = '';
     document.getElementById('staff-password').value = '';

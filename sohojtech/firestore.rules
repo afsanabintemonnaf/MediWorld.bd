@@ -237,16 +237,55 @@ service cloud.firestore {
 
     match /staff/{staffUid} {
       allow read: if (isOwner() && resource.data.ownerUid == request.auth.uid)
-        || (signedIn() && request.auth.uid == staffUid);
-      allow create, update: if isOwner()
+        || (signedIn() && (
+          request.auth.uid == staffUid
+          || (
+            request.auth.token.email != null
+            && resource.data.email == request.auth.token.email
+            && resource.data.status == 'invited'
+          )
+        ));
+      allow create: if isOwner()
         && request.resource.data.ownerUid == request.auth.uid
         && request.resource.data.email is string
         && request.resource.data.role in ['manager', 'cashier']
         && request.resource.data.active is bool
-        && request.resource.data.status in ['active', 'disabled']
+        && request.resource.data.status in ['active', 'disabled', 'invited']
         && request.resource.data.assignedBranchIds is list
         && request.resource.data.permissions is map;
-      allow delete: if isOwner() && resource.data.ownerUid == request.auth.uid;
+      allow update: if (
+        isOwner()
+        && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.email is string
+        && request.resource.data.role in ['manager', 'cashier']
+        && request.resource.data.active is bool
+        && request.resource.data.status in ['active', 'disabled', 'invited']
+        && request.resource.data.assignedBranchIds is list
+        && request.resource.data.permissions is map
+      ) || (
+        signedIn()
+        && request.auth.token.email != null
+        && resource.data.email == request.auth.token.email
+        && resource.data.status == 'invited'
+        && resource.data.active == true
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.ownerUid == resource.data.ownerUid
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.assignedBranchIds == resource.data.assignedBranchIds
+        && request.resource.data.permissions == resource.data.permissions
+        && request.resource.data.active == true
+        && request.resource.data.status == 'active'
+      );
+      allow delete: if (isOwner() && resource.data.ownerUid == request.auth.uid)
+        || (
+          signedIn()
+          && request.auth.token.email != null
+          && resource.data.email == request.auth.token.email
+          && resource.data.status == 'invited'
+          && resource.data.uid == null
+        );
     }
 
     match /workSessions/{sessionId} {

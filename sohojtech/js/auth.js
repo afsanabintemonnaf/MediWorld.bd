@@ -75,16 +75,32 @@ async function resolveIdentity(user) {
       return;
     }
 
+    const normalizedEmail = String(user.email || '').trim().toLowerCase();
     const staffRef = fbDb.collection('staff').doc(user.uid);
-    const staffSnap = await staffRef.get();
-    if (staffSnap.exists) {
-      const staff = staffSnap.data();
-      if (staff.active !== true || staff.status !== 'active') {
-        showAuthScreen('login');
-        toast('এই স্টাফ অ্যাকাউন্ট নিষ্ক্রিয়।', 'e');
-        return;
+    let staffSnap = await staffRef.get();
+    let matchedDocId = staffSnap.exists ? staffSnap.id : null;
+
+    if (!staffSnap.exists && normalizedEmail) {
+      const byEmailSnap = await fbDb.collection('staff')
+        .where('email', '==', normalizedEmail)
+        .limit(1)
+        .get();
+      if (!byEmailSnap.empty) {
+        const candidateDoc = byEmailSnap.docs[0];
+        const candidateData = candidateDoc.data() || {};
+        if (candidateData.uid && candidateData.uid !== user.uid) {
+          showAuthScreen('login');
+          toast('এই স্টাফ ইমেইলটি অন্য অ্যাকাউন্টের সাথে যুক্ত রয়েছে।', 'e');
+          return;
+        }
+        matchedDocId = candidateDoc.id;
+        staffSnap = candidateDoc;
       }
-      if (String(staff.email || '').toLowerCase() !== String(user.email || '').toLowerCase()) {
+    }
+
+    if (staffSnap.exists) {
+      let staff = staffSnap.data() || {};
+      if (String(staff.email || '').trim().toLowerCase() !== normalizedEmail) {
         showAuthScreen('login');
         toast('Staff ইমেইল মিলছে না।', 'e');
         return;
@@ -92,6 +108,26 @@ async function resolveIdentity(user) {
       if (!staff.ownerUid) {
         showAuthScreen('login');
         toast('Staff-এর Owner binding নেই।', 'e');
+        return;
+      }
+      if (staff.status === 'invited' && staff.active !== false && !staff.uid) {
+        const boundStaff = {
+          ...staff,
+          uid: user.uid,
+          email: normalizedEmail,
+          active: true,
+          status: 'active',
+          acceptedAt: firebase.firestore.FieldValue.serverTimestamp(),
+          updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        };
+        await fbDb.collection('staff').doc(user.uid).set(boundStaff, { merge: true });
+        if (matchedDocId && matchedDocId !== user.uid) {
+          await fbDb.collection('staff').doc(matchedDocId).delete().catch(() => {});
+        }
+        staff = { ...boundStaff, updatedAt: Date.now() };
+      } else if (staff.active !== true || staff.status !== 'active') {
+        showAuthScreen('login');
+        toast('এই স্টাফ অ্যাকাউন্ট নিষ্ক্রিয়।', 'e');
         return;
       }
       const platformUser = await getPlatformUserRecord(staff.ownerUid, null);
