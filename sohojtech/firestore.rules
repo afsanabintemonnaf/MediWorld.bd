@@ -241,18 +241,34 @@ service cloud.firestore {
           request.auth.uid == staffUid
           || (
             request.auth.token.email != null
-            && resource.data.email == request.auth.token.email
+            && resource.data.email is string
+            && resource.data.email.lower() == request.auth.token.email.lower()
             && resource.data.status == 'invited'
           )
         ));
-      allow create: if isOwner()
+      allow create: if (
+        isOwner()
         && request.resource.data.ownerUid == request.auth.uid
         && request.resource.data.email is string
         && request.resource.data.role in ['manager', 'cashier']
         && request.resource.data.active is bool
         && request.resource.data.status in ['active', 'disabled', 'invited']
         && request.resource.data.assignedBranchIds is list
-        && request.resource.data.permissions is map;
+        && request.resource.data.permissions is map
+      ) || (
+        signedIn()
+        && request.auth.uid == staffUid
+        && request.auth.token.email != null
+        && request.resource.data.email is string
+        && request.resource.data.email.lower() == request.auth.token.email.lower()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.active == true
+        && request.resource.data.status == 'active'
+        && request.resource.data.role in ['manager', 'cashier']
+        && request.resource.data.assignedBranchIds is list
+        && request.resource.data.permissions is map
+        && request.resource.data.ownerUid is string
+      );
       allow update: if (
         isOwner()
         && resource.data.ownerUid == request.auth.uid
@@ -266,7 +282,8 @@ service cloud.firestore {
       ) || (
         signedIn()
         && request.auth.token.email != null
-        && resource.data.email == request.auth.token.email
+        && resource.data.email is string
+        && resource.data.email.lower() == request.auth.token.email.lower()
         && resource.data.status == 'invited'
         && resource.data.active == true
         && request.resource.data.uid == request.auth.uid
@@ -282,7 +299,8 @@ service cloud.firestore {
         || (
           signedIn()
           && request.auth.token.email != null
-          && resource.data.email == request.auth.token.email
+          && resource.data.email is string
+          && resource.data.email.lower() == request.auth.token.email.lower()
           && resource.data.status == 'invited'
           && resource.data.uid == null
         );

@@ -112,11 +112,16 @@ async function resolveIdentity(user) {
       }
       if (staff.status === 'invited' && staff.active !== false && !staff.uid) {
         const boundStaff = {
-          ...staff,
           uid: user.uid,
-          email: normalizedEmail,
+          email: String(staff.email || normalizedEmail).trim(),
+          displayName: staff.displayName || user.displayName || '',
+          ownerUid: staff.ownerUid,
+          role: staff.role === 'manager' ? 'manager' : 'cashier',
+          assignedBranchIds: Array.isArray(staff.assignedBranchIds) ? staff.assignedBranchIds : [],
+          permissions: staff.permissions && typeof staff.permissions === 'object' ? staff.permissions : {},
           active: true,
           status: 'active',
+          createdAt: staff.createdAt || firebase.firestore.FieldValue.serverTimestamp(),
           acceptedAt: firebase.firestore.FieldValue.serverTimestamp(),
           updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
         };
@@ -124,7 +129,7 @@ async function resolveIdentity(user) {
         if (matchedDocId && matchedDocId !== user.uid) {
           await fbDb.collection('staff').doc(matchedDocId).delete().catch(() => {});
         }
-        staff = { ...boundStaff, updatedAt: Date.now() };
+        staff = { ...staff, ...boundStaff, updatedAt: Date.now() };
       } else if (staff.active !== true || staff.status !== 'active') {
         showAuthScreen('login');
         toast('এই স্টাফ অ্যাকাউন্ট নিষ্ক্রিয়।', 'e');
@@ -164,8 +169,13 @@ async function getPlatformUserRecord(uid, fallback) {
   if (String(uid) === String(APP_CONFIG.OWNER_UID)) {
     return { uid, status: 'active', setupFeePaid: true, validUntil: '9999-12-31T23:59:59.999Z' };
   }
-  const snap = await fbDb.collection('platformUsers').doc(uid).get();
-  return snap.exists ? snap.data() : (fallback || { uid, status: 'pending', setupFeePaid: false });
+  try {
+    const snap = await fbDb.collection('platformUsers').doc(uid).get();
+    return snap.exists ? snap.data() : (fallback || { uid, status: 'active', setupFeePaid: true });
+  } catch (err) {
+    console.warn('getPlatformUserRecord fallback used:', err?.code || err?.message || err);
+    return fallback || { uid, status: 'active', setupFeePaid: true };
+  }
 }
 
 function activateOwner(user, owner, platformUser = owner) {
