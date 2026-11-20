@@ -94,10 +94,13 @@ async function resolveIdentity(user) {
 
     if (!staffSnap.exists && normalizedEmail) {
       console.warn("[AuthStep] step3 staff.where(email) start", normalizedEmail);
-      const byEmailSnap = await fbDb.collection('staff')
-        .where('email', '==', normalizedEmail)
-        .limit(1)
-        .get();
+      const byEmailSnap = await Promise.race([
+        fbDb.collection('staff')
+          .where('email', '==', normalizedEmail)
+          .limit(1)
+          .get(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('staff email lookup timeout')), 8000))
+      ]);
       console.warn("[AuthStep] step3 staff.where(email) done", { empty: byEmailSnap.empty, size: byEmailSnap.size });
       if (!byEmailSnap.empty) {
         const candidateDoc = byEmailSnap.docs[0];
@@ -151,7 +154,9 @@ async function resolveIdentity(user) {
         return;
       }
       const platformUser = await getPlatformUserRecord(staff.ownerUid, null);
+      console.warn("[AuthStep] activating staff", { uid: user.uid, ownerUid: staff.ownerUid, status: staff.status, active: staff.active });
       await activateStaff(user, staff, platformUser);
+      console.warn("[AuthStep] activateStaff finished");
       return;
     }
 
