@@ -64,6 +64,7 @@ function resetIdentityState() {
 }
 
 async function resolveIdentity(user) {
+  console.warn("[AuthTrace] resolveIdentity start", { uid: user.uid, email: user.email });
   const ownerRef = fbDb.collection('owners').doc(user.uid);
   try {
     const ownerSnap = await ownerRef.get();
@@ -211,6 +212,7 @@ function activateOwner(user, owner, platformUser = owner) {
 }
 
 async function activateStaff(user, staff, platformUser) {
+  console.warn("[AuthTrace] activateStaff start", { uid: user.uid, status: staff.status, active: staff.active, branches: staff.assignedBranchIds, ownerUid: staff.ownerUid });
   if (staff.active !== true || staff.status !== 'active') {
     showAuthScreen('login');
     toast('এই স্টাফ অ্যাকাউন্ট নিষ্ক্রিয়।', 'e');
