@@ -119,6 +119,7 @@ async function resolveIdentity(user) {
         }
         matchedDocId = candidateDoc.id;
         staffSnap = candidateDoc;
+        console.warn("[AuthStep] step3 matched doc", { docId: matchedDocId, uid: candidateData.uid || null, status: candidateData.status || null, active: candidateData.active });
       }
     }
 
@@ -135,7 +136,9 @@ async function resolveIdentity(user) {
         toast('Staff-এর Owner binding নেই।', 'e');
         return;
       }
+      console.warn("[AuthStep] evaluating staff doc", { docId: matchedDocId, status: staff.status, active: staff.active, uid: staff.uid || null, ownerUid: staff.ownerUid || null });
       if (staff.status === 'invited' && staff.active !== false && !staff.uid) {
+        console.warn("[AuthStep] binding invited staff", { docId: matchedDocId, newUid: user.uid, ownerUid: staff.ownerUid });
         const boundStaff = {
           uid: user.uid,
           email: String(staff.email || normalizedEmail).trim(),
@@ -160,7 +163,9 @@ async function resolveIdentity(user) {
         toast('এই স্টাফ অ্যাকাউন্ট নিষ্ক্রিয়।', 'e');
         return;
       }
+      console.warn("[AuthStep] calling getPlatformUserRecord", { ownerUid: staff.ownerUid });
       const platformUser = await getPlatformUserRecord(staff.ownerUid, null);
+      console.warn("[AuthStep] getPlatformUserRecord done", { hasPlatformUser: !!platformUser });
       console.warn("[AuthStep] activating staff", { uid: user.uid, ownerUid: staff.ownerUid, status: staff.status, active: staff.active });
       await activateStaff(user, staff, platformUser);
       console.warn("[AuthStep] activateStaff finished");
@@ -274,7 +279,15 @@ async function activateStaff(user, staff, platformUser) {
     watchPlatformEntitlement(staff.ownerUid);
     return;
   }
-  await loadStaffBranches(branchIds);
+  console.warn("[AuthStep] loading staff branches", branchIds);
+  await Promise.race([
+    loadStaffBranches(branchIds),
+    new Promise((resolve) => setTimeout(resolve, 6000))
+  ]);
+  if (!APP_STATE.activeBranchId && branchIds.length) {
+    APP_STATE.activeBranchId = branchIds[0];
+  }
+  console.warn("[AuthStep] staff activeBranchId", APP_STATE.activeBranchId);
   if (!APP_STATE.activeBranchId) {
     showAuthScreen('login');
     toast('কোনো অনুমোদিত Branch পাওয়া যায়নি।', 'e');
