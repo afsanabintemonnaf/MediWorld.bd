@@ -316,6 +316,24 @@ async function loadOwnerBranches() {
     .where('ownerUid', '==', APP_STATE.currentUser.uid)
     .get();
   APP_STATE.branches = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+  if (!APP_STATE.branches.length && APP_STATE.isOwner && !APP_STATE.readOnly && APP_STATE.currentUser?.uid) {
+    try {
+      const branchId = 'BR-' + Date.now();
+      const branchName = (APP_STATE.pharmacyName && APP_STATE.pharmacyName !== 'ফার্মেসি')
+        ? APP_STATE.pharmacyName
+        : 'Main Branch';
+      const payload = {
+        name: branchName,
+        ownerUid: APP_STATE.currentUser.uid,
+        active: true,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      };
+      await fbDb.collection('branches').doc(branchId).set(payload);
+      APP_STATE.branches = [{ id: branchId, ...payload, createdAt: Date.now() }];
+    } catch (err) {
+      console.warn('Default branch auto-create skipped:', err);
+    }
+  }
   selectInitialBranch();
 }
 
