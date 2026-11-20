@@ -412,23 +412,38 @@ function unlockApp(profile) {
   initApp();
 }
 
-function signInWithGoogle() {
-  const provider = new firebase.auth.GoogleAuthProvider();
-  provider.setCustomParameters({ prompt: 'select_account' });
-  fbAuth.signInWithPopup(provider).catch((err) => {
-    const code = err && err.code ? String(err.code) : '';
-    if (
-      code === 'auth/popup-blocked' ||
-      code === 'auth/operation-not-supported-in-this-environment'
-    ) {
-      return fbAuth.signInWithRedirect(provider).catch((redirErr) => {
-        toast('লগইন ব্যর্থ: ' + redirErr.message, 'e');
-      });
+function isCoopOrPopupBlocked(err) {
+  const code = err && err.code ? String(err.code) : "";
+  const msg = err && err.message ? String(err.message).toLowerCase() : "";
+  return (
+    code === "auth/popup-blocked" ||
+    code === "auth/operation-not-supported-in-this-environment" ||
+    code === "auth/cancelled-popup-request" ||
+    msg.includes("cross-origin-opener-policy") ||
+    msg.includes("window.closed")
+  );
+}
+
+if (typeof fbAuth !== "undefined" && typeof fbAuth.getRedirectResult === "function") {
+  fbAuth.getRedirectResult().catch((err) => {
+    if (err && err.code) {
+      toast("লগইন ব্যর্থ: " + (err.message || err.code), "e");
     }
-    toast('লগইন ব্যর্থ: ' + err.message, 'e');
   });
 }
 
+function signInWithGoogle() {
+  const provider = new firebase.auth.GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: "select_account" });
+  fbAuth.signInWithPopup(provider).catch((err) => {
+    if (isCoopOrPopupBlocked(err)) {
+      return fbAuth.signInWithRedirect(provider).catch((redirErr) => {
+        toast("লগইন ব্যর্থ: " + (redirErr && redirErr.message ? redirErr.message : ""), "e");
+      });
+    }
+    toast("লগইন ব্যর্থ: " + (err && err.message ? err.message : ""), "e");
+  });
+}
 function signOutUser() {
   const closeSession = APP_STATE.activeWorkSessionId
     ? fbDb.collection('workSessions').doc(APP_STATE.activeWorkSessionId).set({
