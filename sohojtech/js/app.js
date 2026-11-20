@@ -8,6 +8,13 @@ const BOOT_ANIMATION_MIN_MS = 1400;
 const _bootStartTime = Date.now();
 let activeBranchLoadRequest = 0;
 
+function hasPlatformAppAccess() {
+  if (APP_STATE.isSuperAdmin === true &&
+      (typeof isSuperAdminUser !== 'function' || isSuperAdminUser())) return true;
+  return typeof platformAccessState !== 'function' ||
+    platformAccessState(APP_STATE.platformEntitlement).active;
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   console.log(`${APP_CONFIG.appName} v${APP_CONFIG.version} booting...`);
   applyStoredTheme();
@@ -37,6 +44,19 @@ function updateConnBadge(isOnline) {
 }
 
 async function initApp() {
+  if (!hasPlatformAppAccess()) {
+    APP_STATE.readOnly = true;
+    renderShell();
+    goTab(APP_STATE.isOwner ? 'settings' : 'contact');
+    if (!APP_STATE.isOwner) {
+      const contact = document.getElementById('contact-content');
+      if (contact) contact.innerHTML = renderPlatformAccessRequiredCard();
+    }
+    setLoadingMessage('অনুমোদন বা পেমেন্ট প্রয়োজন।');
+    hideLoadingScreen();
+    showAppRoot();
+    return;
+  }
   setLoadingMessage('ডেটা লোড হচ্ছে...');
   updateConnBadge(navigator.onLine);
   initSyncDB().catch(err => console.warn('SyncDB init ব্যর্থ:', err));
@@ -52,6 +72,23 @@ async function initApp() {
   } catch (err) {
     showFatalError('initApp() এ সমস্যা:\n' + humanizeError(err), err);
     return;
+  }
+
+  function renderPlatformAccessRequiredCard() {
+    const state = typeof platformAccessState === 'function'
+      ? platformAccessState(APP_STATE.platformEntitlement)
+      : { status: 'pending', setupFee: 10000, monthlyFee: 1500 };
+    const setupFee = state.setupFee || 10000;
+    return `<section class="bg-red-50 dark:bg-red-900/20 border border-red-300 dark:border-red-700 rounded-xl p-6">
+      <h2 class="text-lg font-bold text-red-700 dark:text-red-300">${esc(APP_CONFIG.PLATFORM_NAME)} — Approval / Payment Required — অনুমোদন / পেমেন্ট প্রয়োজন</h2>
+      <p class="text-sm mt-2">আপনার ফার্মেসির entitlement সক্রিয় না হওয়া পর্যন্ত মূল ফিচার বন্ধ থাকবে।</p>
+      <ul class="text-sm mt-3 list-disc pl-5">
+        <li>এককালীন setup ৳${setupFee.toLocaleString('bn-BD')} (ঐচ্ছিক store setup +৳৫,০০০)</li>
+        <li>মাসিক maintenance ৳${state.monthlyFee.toLocaleString('bn-BD')}/মাস</li>
+        <li>বর্তমান অবস্থা: ${esc(state.reason || state.status)}</li>
+      </ul>
+      <p class="text-sm mt-3">${esc(APP_CONFIG.PLATFORM_NAME)} Super Admin: ${esc(APP_CONFIG.SUPPORT_PHONE)} · ${esc(APP_CONFIG.OWNER_EMAIL)}</p>
+    </section>`;
   }
 
   renderShell();
@@ -149,8 +186,9 @@ function closeAppModal() {
 function renderSidebarNav() {
   const nav = document.getElementById('sidebar-nav');
   // ✅ নতুন — এই ট্যাবগুলো শুধু owner দেখতে পারবে, staff (manager/cashier) কেউই না
-  const OWNER_ONLY_TABS = ['dashboard', 'analytics'];
+  const OWNER_ONLY_TABS = ['dashboard', 'analytics', 'accounts', 'staff', 'admin', 'aiSettings', 'settings'];
 
+  const needsPlatformApproval = !hasPlatformAppAccess();
   const sections = NAV_CONFIG.filter(s =>
     (s.section !== 'প্রশাসন' || APP_STATE.isAdmin) &&
     (s.section !== 'B2B' || APP_STATE.ads.enabled) &&
@@ -159,6 +197,7 @@ function renderSidebarNav() {
   ).map(s => ({
     ...s,
     items: s.items.filter(item =>
+      (!needsPlatformApproval || ['settings', 'contact', 'about'].includes(item.id)) &&
       !(APP_STATE.isStaffMember && OWNER_ONLY_TABS.includes(item.id)) &&
       (!APP_STATE.isStaffMember || canAccessTab(item.id))
     ),
@@ -205,6 +244,10 @@ function renderShell() {
     APP_STATE.currentTab = 'dashboard';
   }
 
+  if (APP_STATE.currentTab === 'settings' && !APP_STATE.isOwner) {
+    APP_STATE.currentTab = 'pos';
+  }
+
   // ✅ নতুন — staff dashboard/analytics-এ ঢুকলে POS-এ redirect
   // উপরের guard-গুলো dashboard-এ পাঠালেও এই guard সেটাও ধরে POS-এ পাঠাবে।
   if (
@@ -218,6 +261,20 @@ function renderShell() {
 
   goTab(APP_STATE.currentTab);
   setText('sidebar-pharma-name', APP_STATE.pharmacyName);
+  renderWorkspaceBusinessIdentity();
+}
+
+function renderWorkspaceBusinessIdentity() {
+  const el = document.getElementById('workspace-business-identity');
+  if (!el) return;
+  const branch = (APP_STATE.branches || []).find(item => item.id === APP_STATE.activeBranchId);
+  const address = branch?.address || APP_STATE.address || '';
+  el.innerHTML = `
+    <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+      <strong class="text-slate-700 dark:text-slate-200">${esc(APP_STATE.pharmacyName || 'ফার্মেসি')}</strong>
+      ${branch?.name ? `<span>· শাখা: ${esc(branch.name)}</span>` : ''}
+      ${address ? `<span>· ${esc(address)}</span>` : ''}
+    </div>`;
 }
 
 function renderBranchSelector() {
@@ -232,6 +289,7 @@ function renderBranchSelector() {
   el.classList.toggle('hidden', allowed.length === 0);
   if (allowed.length <= 1) el.disabled = true;
   else el.disabled = false;
+  renderWorkspaceBusinessIdentity();
 }
 
 async function changeActiveBranch(branchId) {
@@ -256,6 +314,7 @@ async function changeActiveBranch(branchId) {
   }
   localStorage.setItem('mediworld-active-branch', branchId);
   Object.assign(APP_STATE, data);
+  renderBranchSelector();
   renderTabPanels();
   goTab(APP_STATE.currentTab);
   triggerSync();
@@ -604,10 +663,14 @@ function wireShellEvents() {
 // TAB ROUTER
 // ════════════════════════════════════════════════════════════
 function canAccessTab(tabId) {
+  if (tabId === 'admin') return APP_STATE.isSuperAdmin === true && isSuperAdminUser();
+  if (!hasPlatformAppAccess()) {
+    return ['settings', 'contact', 'about'].includes(tabId);
+  }
   if (APP_STATE.isOwner) return true;
   if (!APP_STATE.isStaffMember) return false;
-  if (['dashboard', 'analytics', 'accounts', 'admin', 'staff', 'aiSettings'].includes(tabId)) return false;
-  if (['contact', 'about', 'settings'].includes(tabId)) return true;
+  if (['dashboard', 'analytics', 'accounts', 'admin', 'staff', 'aiSettings', 'settings'].includes(tabId)) return false;
+  if (['contact', 'about'].includes(tabId)) return true;
   if (tabId === 'shortList') {
     return APP_STATE.permissions?.inventory === true || APP_STATE.permissions?.pos === true;
   }
@@ -656,8 +719,20 @@ function dashboardQuickAction(action) {
 // এসেছে (ইউজার Back চেপেছে) — তখন currentTab আবার tabHistory-তে push
 // করা হবে না, নাহলে back চাপলেও stack বাড়তেই থাকবে (ping-pong bug)।
 function goTab(tabId, opts = {}) {
+  if (tabId === 'admin' && (APP_STATE.isSuperAdmin !== true || !isSuperAdminUser())) {
+    toast(`${APP_CONFIG.PLATFORM_NAME} Platform User Management শুধু Super Admin দেখতে পারবেন।`, 'e');
+    tabId = APP_STATE.isOwner ? 'settings' : 'pos';
+  }
+  if (!hasPlatformAppAccess() && !['settings', 'contact', 'about'].includes(tabId)) {
+    toast(`${APP_CONFIG.PLATFORM_NAME} approval / payment সম্পন্ন করুন।`, 'w');
+    tabId = 'settings';
+  }
+  if (!APP_STATE.isOwner && ['aiSettings', 'settings'].includes(tabId)) {
+    toast('শুধু মালিক Settings ও AI Settings দেখতে পারবেন।', 'e');
+    tabId = 'pos';
+  }
   if (!APP_STATE.isOwner && APP_STATE.isStaffMember && !canAccessTab(tabId)
-      && !['contact', 'about', 'settings'].includes(tabId)) {
+      && !['contact', 'about'].includes(tabId)) {
     toast('এই মডিউলের অনুমতি আপনার নেই।', 'e');
     tabId = 'pos';
   }

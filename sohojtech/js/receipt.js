@@ -13,9 +13,12 @@ const RECEIPT_FONT = "'JetBrains Mono', monospace";
 // buildReceiptConfig(type, doc) — sale/purchase/return → কমন shape
 // ────────────────────────────────────────────────────────────
 function buildReceiptConfig(type, doc) {
+  const branch = (APP_STATE.branches || []).find(item =>
+    item.id === (doc.branchId || APP_STATE.activeBranchId));
   const pharmacy = {
     name: APP_STATE.pharmacyName || 'ফার্মেসি',
-    address: APP_STATE.address || '',
+    branchName: branch?.name || '',
+    address: branch?.address || APP_STATE.address || '',
     phone: APP_STATE.phone || '',
     logoBase64: APP_STATE.logoBase64 || '', // ✅ নতুন
   };
@@ -149,6 +152,7 @@ function buildReceiptHTMLContent(config) {
   return `
     ${logoHTML}
     <div class="r-center r-bold r-name">${esc(p.name)}</div>
+    ${p.branchName ? `<div class="r-center r-small">শাখা: ${esc(p.branchName)}</div>` : ''}
     ${p.address ? `<div class="r-center r-small">${esc(p.address)}</div>` : ''}
     ${p.phone ? `<div class="r-center r-small">${esc(p.phone)}</div>` : ''}
     <div class="r-dashed"></div>
@@ -259,6 +263,10 @@ async function renderReceiptCanvas(config) {
   ctx.fillText(config.pharmacy.name, centerX, y); y += lineHeight + 2;
 
   ctx.font = `10px ${RECEIPT_FONT}`;
+  if (config.pharmacy.branchName) {
+    ctx.fillText('শাখা: ' + config.pharmacy.branchName, centerX, y);
+    y += lineHeight - 4;
+  }
   if (config.pharmacy.address) { ctx.fillText(config.pharmacy.address, centerX, y); y += lineHeight - 4; }
   if (config.pharmacy.phone) { ctx.fillText(config.pharmacy.phone, centerX, y); y += lineHeight - 4; }
 

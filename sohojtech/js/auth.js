@@ -6,10 +6,11 @@ let userDocUnsub = null;
 let ownerUnsub = null;
 let staffUnsub = null;
 let mainAppBooted = false;
+let entitlementExpiryTimer = null;
 
 function initAuthGate() {
   try {
-    firebase.initializeApp(APP_CONFIG.firebase);
+    firebase.initializeApp(getEffectiveFirebaseConfig());
     fbAuth = firebase.auth();
     fbDb = firebase.firestore();
     fbDb.settings({ ignoreUndefinedProperties: true });
@@ -39,10 +40,14 @@ function initAuthGate() {
 }
 
 function resetIdentityState() {
+  if (entitlementExpiryTimer) clearTimeout(entitlementExpiryTimer);
+  entitlementExpiryTimer = null;
   APP_STATE.currentUser = null;
   APP_STATE.isOwner = false;
   APP_STATE.isAdmin = false;
+  APP_STATE.isSuperAdmin = false;
   APP_STATE.isStaffMember = false;
+  APP_STATE.platformEntitlement = null;
   APP_STATE.staffRole = null;
   APP_STATE.assignedBranchIds = [];
   APP_STATE.permissions = {};
@@ -57,13 +62,11 @@ async function resolveIdentity(user) {
     const ownerSnap = await ownerRef.get();
     if (ownerSnap.exists) {
       const owner = ownerSnap.data();
-      if (
-        user.uid === APP_CONFIG.OWNER_UID &&
-        String(owner.uid || user.uid) === user.uid &&
-        String(owner.email || '').toLowerCase() === String(user.email || '').toLowerCase() &&
-        String(owner.role || '').toLowerCase() === 'owner'
-      ) {
-        activateOwner(user, owner);
+      if (String(owner.uid || user.uid) === user.uid &&
+          String(owner.email || '').toLowerCase() === String(user.email || '').toLowerCase() &&
+          String(owner.role || '').toLowerCase() === 'owner') {
+        const platformUser = await getPlatformUserRecord(user.uid, owner);
+        activateOwner(user, owner, platformUser);
         return;
       }
       await fbAuth.signOut();
@@ -74,35 +77,62 @@ async function resolveIdentity(user) {
 
     const staffRef = fbDb.collection('staff').doc(user.uid);
     const staffSnap = await staffRef.get();
-    if (!staffSnap.exists) {
-      showAuthScreen('login');
-      toast('আপনার staff অ্যাকাউন্ট Owner কর্তৃক সক্রিয় করা হয়নি।', 'e');
-      return;
-    }
-    const staff = staffSnap.data();
-    if (staff.active !== true || staff.status !== 'active') {
-      showAuthScreen('login');
-      toast('এই স্টাফ অ্যাকাউন্ট নিষ্ক্রিয়।', 'e');
-      return;
-    }
-    if (String(staff.email || '').toLowerCase() !== String(user.email || '').toLowerCase()) {
-      showAuthScreen('login');
-      toast('Staff ইমেইল মিলছে না।', 'e');
-      return;
-    }
-    if (!staff.ownerUid) {
-      showAuthScreen('login');
-      toast('Staff-এর Owner binding নেই।', 'e');
+    if (staffSnap.exists) {
+      const staff = staffSnap.data();
+      if (staff.active !== true || staff.status !== 'active') {
+        showAuthScreen('login');
+        toast('এই স্টাফ অ্যাকাউন্ট নিষ্ক্রিয়।', 'e');
+        return;
+      }
+      if (String(staff.email || '').toLowerCase() !== String(user.email || '').toLowerCase()) {
+        showAuthScreen('login');
+        toast('Staff ইমেইল মিলছে না।', 'e');
+        return;
+      }
+      if (!staff.ownerUid) {
+        showAuthScreen('login');
+        toast('Staff-এর Owner binding নেই।', 'e');
+        return;
+      }
+      const platformUser = await getPlatformUserRecord(staff.ownerUid, null);
+      await activateStaff(user, staff, platformUser);
       return;
     }
 
-    activateStaff(user, staff);
+    let request = await fbDb.collection('platformUsers').doc(user.uid).get();
+    if (!request.exists) {
+      const pending = {
+        uid: user.uid,
+        email: String(user.email || '').toLowerCase(),
+        displayName: user.displayName || '',
+        status: 'pending',
+        setupFeePaid: false,
+        storeSetupAssistance: false,
+        validUntil: null,
+        createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+      };
+      await fbDb.collection('platformUsers').doc(user.uid).set(pending);
+      request = await fbDb.collection('platformUsers').doc(user.uid).get();
+    }
+    const requestData = request.data();
+    if (String(requestData.email || '').toLowerCase() !== String(user.email || '').toLowerCase()) {
+      throw new Error('Platform user ইমেইল binding মিলছে না।');
+    }
+    activateOwner(user, requestData, requestData);
   } catch (err) {
     showFatalError('Identity যাচাই করতে সমস্যা:\n' + err.message, err);
   }
 }
 
-function activateOwner(user, owner) {
+async function getPlatformUserRecord(uid, fallback) {
+  if (String(uid) === String(APP_CONFIG.OWNER_UID)) {
+    return { uid, status: 'active', setupFeePaid: true, validUntil: '9999-12-31T23:59:59.999Z' };
+  }
+  const snap = await fbDb.collection('platformUsers').doc(uid).get();
+  return snap.exists ? snap.data() : (fallback || { uid, status: 'pending', setupFeePaid: false });
+}
+
+function activateOwner(user, owner, platformUser = owner) {
   APP_STATE.currentUser = {
     uid: user.uid,
     email: user.email,
@@ -110,17 +140,29 @@ function activateOwner(user, owner) {
     photoURL: user.photoURL || '',
   };
   APP_STATE.isOwner = true;
-  APP_STATE.isAdmin = true;
+  APP_STATE.isSuperAdmin = isSuperAdminUser(user);
+  APP_STATE.isAdmin = APP_STATE.isSuperAdmin;
   APP_STATE.isStaffMember = false;
+  APP_STATE.platformEntitlement = platformUser;
   APP_STATE.staffRole = 'owner';
   APP_STATE.assignedBranchIds = ['*'];
   APP_STATE.permissions = { owner: true };
   APP_STATE.tenantUid = user.uid;
-  APP_STATE.readOnly = false;
-  loadOwnerBranches().then(() => unlockApp(APP_STATE.currentUser));
+  APP_STATE.readOnly = !APP_STATE.isSuperAdmin && !platformAccessState(platformUser).active;
+  if (APP_STATE.isSuperAdmin || platformAccessState(platformUser).active) {
+    loadOwnerBranches().then(() => unlockApp(APP_STATE.currentUser));
+  } else {
+    unlockApp(APP_STATE.currentUser);
+  }
+  if (!APP_STATE.isSuperAdmin) watchPlatformEntitlement(user.uid);
 }
 
-async function activateStaff(user, staff) {
+async function activateStaff(user, staff, platformUser) {
+  if (staff.active !== true || staff.status !== 'active') {
+    showAuthScreen('login');
+    toast('এই স্টাফ অ্যাকাউন্ট নিষ্ক্রিয়।', 'e');
+    return;
+  }
   const branchIds = Array.isArray(staff.assignedBranchIds) ? staff.assignedBranchIds : [];
   if (!branchIds.length) {
     showAuthScreen('login');
@@ -136,12 +178,25 @@ async function activateStaff(user, staff) {
   };
   APP_STATE.isOwner = false;
   APP_STATE.isAdmin = false;
+  APP_STATE.isSuperAdmin = false;
   APP_STATE.isStaffMember = true;
+  APP_STATE.platformEntitlement = platformUser;
   APP_STATE.staffRole = staff.role === 'manager' ? 'manager' : 'cashier';
   APP_STATE.assignedBranchIds = branchIds;
   APP_STATE.permissions = staff.permissions || {};
   APP_STATE.tenantUid = String(staff.ownerUid || APP_CONFIG.OWNER_UID);
-  APP_STATE.readOnly = false;
+  APP_STATE.readOnly = !platformAccessState(platformUser).active;
+  if (APP_STATE.readOnly) {
+    APP_STATE.currentUser = {
+      uid: user.uid,
+      email: user.email,
+      displayName: user.displayName || staff.displayName || '',
+      photoURL: user.photoURL || '',
+    };
+    unlockApp(APP_STATE.currentUser);
+    watchPlatformEntitlement(staff.ownerUid);
+    return;
+  }
   await loadStaffBranches(branchIds);
   if (!APP_STATE.activeBranchId) {
     showAuthScreen('login');
@@ -202,6 +257,58 @@ async function activateStaff(user, staff) {
   }).catch((err) => console.warn('Work session তৈরি হয়নি:', err));
 
   unlockApp(APP_STATE.currentUser);
+  watchPlatformEntitlement(staff.ownerUid);
+}
+
+function watchPlatformEntitlement(uid) {
+  if (ownerUnsub) ownerUnsub();
+  ownerUnsub = fbDb.collection('platformUsers').doc(uid).onSnapshot((snap) => {
+    if (!snap.exists) return;
+    const wasAllowed = APP_STATE.isSuperAdmin === true || !APP_STATE.readOnly;
+    APP_STATE.platformEntitlement = snap.data();
+    APP_STATE.readOnly = APP_STATE.isSuperAdmin !== true &&
+      !platformAccessState(APP_STATE.platformEntitlement).active;
+    schedulePlatformExpiryCheck();
+    const isAllowed = APP_STATE.isSuperAdmin === true || !APP_STATE.readOnly;
+    if (mainAppBooted && wasAllowed !== isAllowed) {
+      mainAppBooted = false;
+      if (!isAllowed) {
+        initApp();
+      } else if (APP_STATE.isOwner) {
+        loadOwnerBranches().then(() => initApp())
+          .catch(err => showFatalError('Entitlement পরিবর্তনের পর workspace লোড ব্যর্থ:\n' + humanizeError(err), err));
+      } else {
+        const identity = APP_STATE.currentUser;
+        fbDb.collection('staff').doc(identity.uid).get()
+          .then(snap => {
+            if (!snap.exists) throw new Error('Staff binding পাওয়া যায়নি।');
+            return activateStaff(identity, snap.data(), APP_STATE.platformEntitlement);
+          })
+          .catch(err => showFatalError('Staff entitlement চালু করতে ব্যর্থ:\n' + humanizeError(err), err));
+      }
+    }
+  }, err => console.warn('Platform entitlement listener:', err));
+}
+
+function schedulePlatformExpiryCheck() {
+  if (entitlementExpiryTimer) clearTimeout(entitlementExpiryTimer);
+  entitlementExpiryTimer = null;
+  if (APP_STATE.isSuperAdmin === true) return;
+  const expiry = APP_STATE.platformEntitlement?.validUntil;
+  const expiryTime = expiry && typeof expiry.toMillis === 'function'
+    ? expiry.toMillis()
+    : new Date(expiry || 0).getTime();
+  if (!Number.isFinite(expiryTime) || expiryTime <= Date.now()) return;
+  const delay = Math.min(expiryTime - Date.now(), 24 * 60 * 60 * 1000);
+  entitlementExpiryTimer = setTimeout(() => {
+    APP_STATE.readOnly = !platformAccessState(APP_STATE.platformEntitlement).active;
+    if (APP_STATE.readOnly && mainAppBooted) {
+      mainAppBooted = false;
+      initApp();
+    } else {
+      schedulePlatformExpiryCheck();
+    }
+  }, delay);
 }
 
 async function loadOwnerBranches() {

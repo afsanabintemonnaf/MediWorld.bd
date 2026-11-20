@@ -169,6 +169,13 @@ function calcPress(k) {
 // raw permission-denied এরর মেসেজের বদলে বন্ধুত্বপূর্ণ বার্তা দেখানোর জন্য।
 // ════════════════════════════════════════════════════════════
 function guardReadOnly() {
+  if (APP_STATE.isSuperAdmin !== true &&
+      APP_STATE.isOwner === true &&
+      typeof platformAccessState === 'function' &&
+      !platformAccessState(APP_STATE.platformEntitlement).active) {
+    toast('অনুমোদন বা পেমেন্ট সম্পন্ন না হওয়া পর্যন্ত ফার্মেসির কাজ বন্ধ থাকবে।', 'w');
+    return true;
+  }
   if (APP_STATE.readOnly) {
     toast('নতুন এন্ট্রি বা পরিবর্তন এখন অনুমোদিত নয়।', 'w');
     return true;
@@ -185,6 +192,18 @@ function guardReadOnly() {
     }
   }
   return false;
+}
+
+function guardOwnerOnly() {
+  if (
+    APP_STATE.isOwner === true &&
+    APP_STATE.isStaffMember !== true &&
+    APP_STATE.readOnly !== true
+  ) {
+    return false;
+  }
+  toast('শুধু মালিক এই সেটিংস দেখতে, পরিবর্তন করতে, পরীক্ষা করতে বা রিসেট/এক্সপোর্ট করতে পারবেন।', 'e');
+  return true;
 }
 
 // ════════════════════════════════════════════════════════════

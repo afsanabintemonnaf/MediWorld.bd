@@ -268,11 +268,13 @@ function buildMedDisplayText(m) {
 // ────────────────────────────────────────────────────────────
 let posPrescriptionImageBase64 = '';
 let posPrescriptionCandidates = [];
+let posPrescriptionExtracted = [];
 
 function openPOSPrescriptionQuickMatch() {
   document.getElementById('pos-prescription-modal')?.remove();
   posPrescriptionImageBase64 = '';
   posPrescriptionCandidates = [];
+  posPrescriptionExtracted = [];
 
   const modal = document.createElement('div');
   modal.id = 'pos-prescription-modal';
@@ -327,6 +329,7 @@ function closePOSPrescriptionQuickMatch() {
   document.getElementById('pos-prescription-modal')?.remove();
   posPrescriptionImageBase64 = '';
   posPrescriptionCandidates = [];
+  posPrescriptionExtracted = [];
 }
 
 function compressPOSPrescriptionImage(file) {
@@ -454,6 +457,67 @@ function scorePOSPrescriptionCandidate(candidate, term) {
   return score;
 }
 
+function verifyPrescriptionItemAgainstInventory(extracted, state) {
+  extracted = extracted || {};
+  state = state || APP_STATE;
+  const term = [extracted.possibleName, extracted.brand, extracted.generic, extracted.strength]
+    .filter(Boolean).join(' ');
+  const candidates = [];
+  (state.inventory || []).forEach(inv => {
+    const med = (state.medicines || []).find(m => m.id === inv.medId);
+    candidates.push(buildPOSPrescriptionCandidate(inv, med));
+  });
+  (state.medicines || []).forEach(med => {
+    if (!(state.inventory || []).some(inv => inv.medId === med.id)) {
+      candidates.push(buildPOSPrescriptionCandidate(null, med));
+    }
+  });
+  const scored = candidates.map(candidate => ({
+    candidate,
+    score: scorePOSPrescriptionCandidate(candidate, term),
+  })).filter(row => row.score >= 12).sort((a, b) => b.score - a.score);
+  if (!scored.length) return { status: 'unmatched', term, message: 'স্থানীয় ইনভেন্টরিতে মিল নেই।' };
+
+  const best = scored[0];
+  const second = scored[1];
+  const ambiguous = best.score < 45 || (second && second.score >= 45 && best.score - second.score < 12);
+  if (ambiguous) return {
+    status: 'ambiguous',
+    term,
+    candidate: best.candidate,
+    score: best.score,
+    alternatives: scored.slice(0, 3).map(row => row.candidate),
+    message: 'একাধিক সম্ভাবনা বা অস্পষ্ট মিল—ফার্মাসিস্টকে ছবি দেখে নিশ্চিত করতে হবে।',
+  };
+
+  const inv = best.candidate.inv;
+  const now = new Date();
+  now.setHours(0, 0, 0, 0);
+  const liveBatches = inv ? (inv.batches || []).filter(batch => {
+    const expiry = typeof parseExpiryDate === 'function' ? parseExpiryDate(batch.expiry) : null;
+    return Number(batch.stock || 0) > 0 && (!expiry || expiry >= now);
+  }).sort((a, b) => String(a.expiry || '').localeCompare(String(b.expiry || ''))) : [];
+  const stock = inv ? liveBatches.reduce((sum, batch) => sum + Number(batch.stock || 0), 0) : 0;
+  if (stock <= 0) return {
+    status: 'unavailable',
+    term,
+    candidate: best.candidate,
+    score: best.score,
+    stock: 0,
+    message: 'মিল পাওয়া গেছে, কিন্তু live FEFO ব্যাচে স্টক নেই বা ব্যাচ মেয়াদউত্তীর্ণ।',
+  };
+  return {
+    status: 'verified',
+    term,
+    candidate: best.candidate,
+    score: best.score,
+    stock,
+    sellPrice: Number(best.candidate.sellPrice || 0),
+    nearestLiveExpiry: liveBatches[0]?.expiry || '',
+    liveBatches,
+  };
+}
+
 function renderPOSPrescriptionCandidates(terms) {
   const box = document.getElementById('pos-prescription-candidates');
   if (!box) return;
@@ -498,7 +562,7 @@ function renderPOSPrescriptionCandidates(terms) {
 
       box.insertAdjacentHTML('beforeend', `
         <label class="flex items-start gap-3 border ${candidateIndex === 0 ? 'border-brand/50' : 'border-slate-200 dark:border-slate-700'} rounded-lg p-3 hover:bg-slate-50 dark:hover:bg-slate-700/30 cursor-pointer">
-          <input type="checkbox" id="pos-prescription-selected-${index}" class="mt-1" ${candidateIndex === 0 && row.score >= 45 ? 'checked' : ''}/>
+          <input type="checkbox" id="pos-prescription-selected-${index}" class="mt-1"/>
           <div class="flex-1 min-w-0">
             <div class="font-semibold text-sm text-slate-800 dark:text-white">${esc(candidate.brand)} <span class="font-normal text-slate-500">${esc(candidate.doseForm || '')} ${esc(candidate.strength || '')}</span></div>
             ${candidate.generic ? `<div class="text-[11px] text-slate-400">জেনেরিক: ${esc(candidate.generic)}</div>` : ''}
@@ -542,9 +606,27 @@ async function runPOSPrescriptionMatch() {
       try {
         const result = await callAiTask('prescriptionAssist', { imageBase64: posPrescriptionImageBase64.replace(/^data:image\/[^;]+;base64,/, '') });
         const suggestions = result?.data?.suggestions || [];
-        const aiTerms = suggestions.map(s => s.possibleName).filter(Boolean);
+        posPrescriptionExtracted = suggestions.map(s => ({
+          possibleName: s.possibleName || s.brand || s.generic || s.rawText || '',
+          brand: s.brand || '',
+          generic: s.generic || '',
+          strength: s.strength || '',
+          doseForm: s.doseForm || '',
+          frequencySig: s.frequencySig || s.frequency || '',
+          duration: s.duration || '',
+          quantity: s.quantity || null,
+          confidence: s.confidence || 'low',
+          unclear: s.unclear === true || s.confidence === 'low',
+          rawText: s.rawText || '',
+        })).filter(item => item.possibleName);
+        const aiTerms = posPrescriptionExtracted.map(s =>
+          [s.possibleName, s.brand, s.generic, s.strength, s.doseForm].filter(Boolean).join(' ').trim()
+        ).filter(Boolean);
         if (aiTerms.length) terms = Array.from(new Set(terms.concat(aiTerms)));
-        status.textContent = aiTerms.length ? 'ছবি স্ক্যান হয়েছে — AI সাজেশন যাচাই করে নিন।' : 'স্ক্যান হয়েছে, কিন্তু নির্দিষ্ট ওষুধের নাম পাওয়া যায়নি।';
+        const note = result?.data?.patientNotes || result?.data?.doctorNotes;
+        status.textContent = aiTerms.length
+          ? `ছবি স্ক্যান হয়েছে — AI সাজেশন অনিশ্চিত; ফার্মাসিস্ট ছবি দেখে নিজে যাচাই করুন।${note ? ' রোগী/ডাক্তার নোট আছে।' : ''}`
+          : 'স্ক্যান হয়েছে, কিন্তু নির্দিষ্ট ওষুধের নাম পাওয়া যায়নি।';
         status.className = 'text-xs mt-2 text-slate-500';
         status.classList.remove('hidden');
       } catch (err) {
@@ -564,6 +646,22 @@ async function runPOSPrescriptionMatch() {
   }
   const box = document.getElementById('pos-prescription-candidates');
   box.innerHTML = '';
+  if (posPrescriptionExtracted.length) {
+    box.insertAdjacentHTML('beforeend', posPrescriptionExtracted.map((item, index) => `
+      <div class="border ${item.unclear ? 'border-amber-300 bg-amber-50 dark:bg-amber-900/20' : 'border-slate-200 dark:border-slate-700'} rounded-lg p-3">
+        <div class="flex justify-between gap-2">
+          <div class="text-sm font-semibold">${esc(item.possibleName)} ${esc(item.strength)}</div>
+          <span class="text-[10px] ${item.unclear ? 'text-amber-700' : 'text-emerald-600'}">${item.unclear ? 'স্পষ্ট নয়—ফার্মাসিস্ট যাচাই' : 'যাচাইযোগ্য পাঠ'}</span>
+        </div>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-2 mt-2 text-[11px] text-slate-500">
+          <span>ফরম: ${esc(item.doseForm || '—')}</span>
+          <span>Frequency: ${esc(item.frequencySig || '—')}</span>
+          <span>Duration: ${esc(item.duration || '—')}</span>
+          <span>Quantity: ${esc(item.quantity == null ? '—' : String(item.quantity))}</span>
+        </div>
+        ${item.rawText ? `<div class="text-[10px] text-slate-400 mt-1">মূল লেখা: ${esc(item.rawText)}</div>` : ''}
+      </div>`).join(''));
+  }
   renderPOSPrescriptionCandidates(Array.from(new Set(terms.map(t => t.trim()).filter(Boolean))));
 }
 
@@ -572,9 +670,21 @@ function confirmPOSPrescriptionSelection() {
   posPrescriptionCandidates.forEach((row, index) => {
     const checkbox = document.getElementById(`pos-prescription-selected-${index}`);
     if (!checkbox?.checked || !row.candidate) return;
+    if (row.score < 45) {
+      toast(`${row.term}: অস্পষ্ট মিল। ছবি দেখে হাতে নির্বাচন/কনফার্ম করুন।`, 'w');
+      return;
+    }
     const inv = row.candidate.inv;
     if (!inv || inv.totalStock <= 0) {
       toast(`${row.candidate.brand}: বর্তমান শাখায় স্টক নেই।`, 'w');
+      return;
+    }
+    const liveFefoBatch = (inv.batches || []).filter(batch => {
+      const expiry = typeof parseExpiryDate === 'function' ? parseExpiryDate(batch.expiry) : null;
+      return Number(batch.stock || 0) > 0 && (!expiry || expiry >= new Date());
+    }).sort((a, b) => String(a.expiry || '').localeCompare(String(b.expiry || '')))[0];
+    if (!liveFefoBatch) {
+      toast(`${row.candidate.brand}: live FEFO ব্যাচে বিক্রয়ের যোগ্য স্টক নেই।`, 'w');
       return;
     }
     const qtyInput = document.getElementById(`pos-prescription-qty-${index}`);

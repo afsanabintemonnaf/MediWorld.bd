@@ -11,9 +11,28 @@ function renderAboutModule() {
 
   c.innerHTML = `
     ${renderAboutStoryCard()}
+    ${renderPlatformOwnerCard()}
     ${renderProductsCard()}
     ${renderReferralCard()}
   `;
+}
+
+function renderPlatformOwnerCard() {
+  const platformName = APP_CONFIG.PLATFORM_NAME;
+  const phone = APP_CONFIG.SUPPORT_PHONE || '';
+  const email = APP_CONFIG.OWNER_EMAIL || '';
+  return `
+    <div class="bg-white dark:bg-slate-800 border border-brand/20 rounded-xl p-5 mb-4">
+      <h5 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3 flex items-center gap-2">
+        <i class="fa-solid fa-building-shield text-brand"></i> প্ল্যাটফর্ম মালিক ও পরিচালনাকারী
+      </h5>
+      <p class="text-base font-bold text-slate-800 dark:text-white">${esc(platformName)}</p>
+      <p class="text-xs text-slate-500 dark:text-slate-400 mt-1">MediWorld BD প্ল্যাটফর্মের মালিক ও পরিচালনাকারী প্রতিষ্ঠান</p>
+      <div class="flex flex-wrap gap-x-4 gap-y-2 mt-3 text-xs">
+        ${phone ? `<a href="tel:${esc(phone)}" class="text-brand hover:underline"><i class="fa-solid fa-phone mr-1"></i>${esc(phone)}</a>` : ''}
+        ${email ? `<a href="mailto:${esc(email)}" class="text-brand hover:underline"><i class="fa-solid fa-envelope mr-1"></i>${esc(email)}</a>` : ''}
+      </div>
+    </div>`;
 }
 
 function renderAboutStoryCard() {

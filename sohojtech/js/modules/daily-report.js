@@ -193,7 +193,7 @@ function printDailyReport(mode = 'summary') {
     <table><thead><tr><th>তারিখ</th><th>ধরন</th><th>বিবরণ</th><th>পরিমাণ</th><th>Branch</th></tr></thead><tbody>${rows.map(r => `<tr><td>${esc(r.date)}</td><td>${esc(r.category)}</td><td>${esc(r.description)}</td><td>${esc((r.flow === 'out' ? '-' : r.flow === 'in' ? '+' : '') + '৳' + fmt(r.amount))}</td><td>${esc(branchName(r.branchId))}</td></tr>`).join('')}</tbody></table>`;
   const body = mode === 'detailed' ? detailedHtml : summaryHtml;
   const w = window.open('', '_blank');
-  w.document.write(`<html><head><meta charset="utf-8"><title>সহজটেক / SohojTech — দৈনিক রিপোর্ট</title><style>body{font-family:'Noto Sans Bengali',sans-serif;padding:24px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left}</style></head><body><h2>সহজটেক / SohojTech — দৈনিক/পরিসর রিপোর্ট (${mode === 'detailed' ? 'বিস্তারিত' : 'সারসংক্ষেপ'})</h2><p>${esc(APP_STATE.reportFrom)} থেকে ${esc(APP_STATE.reportTo)}</p>${body}</body></html>`);
+  w.document.write(`<html><head><meta charset="utf-8"><title>${esc(APP_CONFIG.PLATFORM_NAME)} — দৈনিক রিপোর্ট</title><style>body{font-family:'Noto Sans Bengali',sans-serif;padding:24px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px;text-align:left}</style></head><body><h2>${esc(APP_CONFIG.PLATFORM_NAME)} — দৈনিক/পরিসর রিপোর্ট (${mode === 'detailed' ? 'বিস্তারিত' : 'সারসংক্ষেপ'})</h2><p>${esc(APP_STATE.reportFrom)} থেকে ${esc(APP_STATE.reportTo)}</p>${body}</body></html>`);
   w.document.close();
   w.print();
 }

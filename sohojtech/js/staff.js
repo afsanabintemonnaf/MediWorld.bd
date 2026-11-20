@@ -26,9 +26,9 @@ function staffRolePreset(role) {
 }
 
 function renderStaffModule() {
-  if (!APP_STATE.isOwner) {
+  if (!APP_STATE.isOwner || guardOwnerOnly()) {
     document.getElementById('staff-content').innerHTML =
-      '<div class="text-sm text-red-500 p-5">স্টাফ পরিচালনা শুধু Super Admin-এর জন্য।</div>';
+      '<div class="text-sm text-red-500 p-5">অনুমোদিত Owner নিজের ব্যবসার Staff ও Branch পরিচালনা করতে পারবেন।</div>';
     return;
   }
   const c = document.getElementById('staff-content');
@@ -74,6 +74,7 @@ function renderStaffModule() {
 }
 
 async function createBranch() {
+  if (guardOwnerOnly()) return;
   const name = document.getElementById('branch-name').value.trim();
   if (!name) return toast('Branch নাম দিন।', 'w');
   const address = document.getElementById('branch-address').value.trim();
@@ -97,6 +98,7 @@ async function createBranch() {
 }
 
 function loadStaffAndBranches() {
+  if (guardOwnerOnly()) return;
   if (staffListUnsub) staffListUnsub();
   if (branchListUnsub) branchListUnsub();
   let latestBranches = [];
@@ -154,7 +156,7 @@ async function loadSalarySetupValues(staff) {
 }
 
 async function saveStaffSalarySetup(staffUid) {
-  if (!APP_STATE.isOwner) return;
+  if (guardOwnerOnly()) return;
   const baseSalary = round2(parseFloat(document.getElementById(`salary-base-${staffUid}`)?.value) || 0);
   const payCycle = document.getElementById(`salary-cycle-${staffUid}`)?.value || 'monthly';
   const branchId = document.getElementById(`salary-branch-${staffUid}`)?.value;
@@ -199,6 +201,7 @@ function renderBranchManagementList(branches) {
 }
 
 async function saveBranchDetails(branchId) {
+  if (guardOwnerOnly()) return;
   const name = document.getElementById(`branch-edit-name-${branchId}`)?.value.trim();
   if (!name) return toast('Branch নাম দিন।', 'w');
   const address = document.getElementById(`branch-edit-address-${branchId}`)?.value.trim() || '';
@@ -215,6 +218,7 @@ async function saveBranchDetails(branchId) {
 }
 
 async function toggleBranchActive(branchId, isActive) {
+  if (guardOwnerOnly()) return;
   const branch = APP_STATE.branches.find(b => b.id === branchId);
   if (!branch) return toast('Branch পাওয়া যায়নি।', 'e');
   if (isActive) {
@@ -270,7 +274,7 @@ function applyStaffRolePreset(role) {
 }
 
 async function createOrLinkStaff() {
-  if (!APP_STATE.isOwner) return;
+  if (guardOwnerOnly()) return;
   const name = document.getElementById('staff-name')?.value.trim() || '';
   const email = document.getElementById('staff-email')?.value.trim().toLowerCase() || '';
   const password = document.getElementById('staff-password')?.value || '';
@@ -369,6 +373,7 @@ function renderStaffRosterList(staff, branches) {
 }
 
 async function toggleStaffBranch(staffUid, branchId, checked) {
+  if (guardOwnerOnly()) return;
   if (staffUid === APP_STATE.currentUser?.uid) return toast('নিজের Branch assignment পরিবর্তন করা যাবে না।', 'e');
   const snap = await fbDb.collection('staff').doc(staffUid).get();
   if (!snap.exists) return;
@@ -381,6 +386,7 @@ async function toggleStaffBranch(staffUid, branchId, checked) {
 }
 
 async function toggleStaffStatus(staffUid, status) {
+  if (guardOwnerOnly()) return;
   if (staffUid === APP_STATE.currentUser?.uid) return toast('নিজের স্টাফ স্ট্যাটাস পরিবর্তন করা যাবে না।', 'e');
   if (status === 'disabled' && !confirm('এই স্টাফকে সাসপেন্ড/Disable করবেন? অ্যাকাউন্টের binding অকার্যকর হবে (active=false, status=disabled)। Firebase Auth login নিজে মুছবে না।')) return;
   await fbDb.collection('staff').doc(staffUid).update({
@@ -390,6 +396,7 @@ async function toggleStaffStatus(staffUid, status) {
 }
 
 async function changeStaffRole(staffUid, role) {
+  if (guardOwnerOnly()) return;
   if (staffUid === APP_STATE.currentUser?.uid) return toast('নিজের রোল পরিবর্তন করা যাবে না।', 'e');
   const safeRole = role === 'manager' ? 'manager' : 'cashier';
   if (!confirm('রোল পরিবর্তন করলে বর্তমান custom permissions পরিবর্তন করে রোলের preset দিয়ে ওভাররাইট হবে। এগোবেন?')) return;
@@ -402,6 +409,7 @@ async function changeStaffRole(staffUid, role) {
 }
 
 async function toggleStaffPermission(staffUid, permission, checked) {
+  if (guardOwnerOnly()) return;
   if (staffUid === APP_STATE.currentUser?.uid) return toast('নিজের permission পরিবর্তন করা যাবে না।', 'e');
   await fbDb.collection('staff').doc(staffUid).update({
     [`permissions.${permission}`]: checked,
@@ -410,6 +418,7 @@ async function toggleStaffPermission(staffUid, permission, checked) {
 }
 
 async function deleteStaffRecord(staffUid) {
+  if (guardOwnerOnly()) return;
   if (staffUid === APP_STATE.currentUser?.uid) return toast('নিজের staff রেকর্ড মুছে ফেলবেন না।', 'e');
   if (!confirm('শুধু staff/{uid} binding রেকর্ড মুছবেন? Firebase Auth login/account নিজে মুছে যাবে না; মুছে নেওয়ার পর এই UID আর অনুমোদিত থাকবে না।')) return;
   await fbDb.collection('staff').doc(staffUid).delete()

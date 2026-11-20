@@ -277,7 +277,7 @@ function openReorderWhatsAppPreview(groupKey, title, phone, trigger) {
     const qty = m.orderQty || Math.max(1, (m.reorderLevel || 10) * 2 - (m.totalStock || 0));
     return `${i + 1}. ${m.brand} ${m.doseForm || ''} ${m.strength || ''} — পরিমাণ: ${qty.toLocaleString('bn-BD')} ইউনিট`;
   });
-  const text = `সহজটেক / SohojTech\nBranch: ${branchName(APP_STATE.activeBranchId)}\nতারিখ: ${todayStr()}\nকোম্পানি: ${title.split(' — ')[0] || title}${representative ? `\nপ্রতিনিধি: ${representative}` : ''}\n\nঅর্ডারের তালিকা:\n${lines.join('\n')}\n\nঅনুগ্রহ করে সরবরাহ নিশ্চিত করুন। ধন্যবাদ।`;
+  const text = `${APP_CONFIG.PLATFORM_NAME}\nBranch: ${branchName(APP_STATE.activeBranchId)}\nতারিখ: ${todayStr()}\nকোম্পানি: ${title.split(' — ')[0] || title}${representative ? `\nপ্রতিনিধি: ${representative}` : ''}\n\nঅর্ডারের তালিকা:\n${lines.join('\n')}\n\nঅনুগ্রহ করে সরবরাহ নিশ্চিত করুন। ধন্যবাদ।`;
   document.getElementById('reorder-whatsapp-modal')?.remove();
   const modal = document.createElement('div');
   modal.id = 'reorder-whatsapp-modal';
@@ -363,7 +363,7 @@ function downloadReorderCsv() {
 function printReorderReport() {
   const rows = getReorderReportRows();
   const w = window.open('', '_blank');
-  w.document.write(`<html><head><meta charset="utf-8"><title>সহজটেক / SohojTech - রি-অর্ডার</title><style>body{font-family:'Noto Sans Bengali',sans-serif;padding:24px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px}</style></head><body><h2>সহজটেক / SohojTech — রি-অর্ডার রিপোর্ট</h2><p>Branch: ${esc(branchName(APP_STATE.activeBranchId))} | Date: ${todayStr()}</p><table><thead><tr><th>কোম্পানি</th><th>প্রতিনিধি</th><th>ওষুধ</th><th>স্টক</th><th>লেভেল</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.company)}</td><td>${esc(r.representative)}</td><td>${esc(r.medicine)}</td><td>${r.stock}</td><td>${r.reorderLevel}</td></tr>`).join('')}</tbody></table></body></html>`);
+  w.document.write(`<html><head><meta charset="utf-8"><title>${esc(APP_CONFIG.PLATFORM_NAME)} - রি-অর্ডার</title><style>body{font-family:'Noto Sans Bengali',sans-serif;padding:24px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ddd;padding:8px}</style></head><body><h2>${esc(APP_CONFIG.PLATFORM_NAME)} — রি-অর্ডার রিপোর্ট</h2><p>Branch: ${esc(branchName(APP_STATE.activeBranchId))} | Date: ${todayStr()}</p><table><thead><tr><th>কোম্পানি</th><th>প্রতিনিধি</th><th>ওষুধ</th><th>স্টক</th><th>লেভেল</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${esc(r.company)}</td><td>${esc(r.representative)}</td><td>${esc(r.medicine)}</td><td>${r.stock}</td><td>${r.reorderLevel}</td></tr>`).join('')}</tbody></table></body></html>`);
   w.document.close(); w.print();
 }
 

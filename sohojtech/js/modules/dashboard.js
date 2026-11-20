@@ -657,40 +657,193 @@ function goToReportPeriod(type) {
 
 let _aiInsightAvailability = null;
 
-function buildAiInsightSummaryPayload(state) {
-  const m = computeDashboardMetrics(state);
-  const thisMonth = getMonthRangeOffset(0);
-  const lastMonth = getMonthRangeOffset(-1);
-  const expiryAlertDays = state.expiryAlertDays || 90;
+function buildVerifiedInsightMetrics(state, now = new Date()) {
+  state = state || {};
+  const sales = Array.from(state.sales || []);
+  const inventory = Array.from(state.inventory || []);
+  const medicines = Array.from(state.medicines || []);
+  const today = typeof todayStr === 'function'
+    ? todayStr()
+    : now.toISOString().slice(0, 10);
+  const todaySales = sales.filter(s => s.date === today);
+
+  let todayRevenue = 0;
+  let todayCogs = 0;
+  let todayInvoiceCount = 0;
+  let lineMathMismatchCount = 0;
+  todaySales.forEach(sale => {
+    todayInvoiceCount += 1;
+    (sale.items || []).forEach(item => {
+      const qty = Number(item.qty || 0);
+      const price = Number(item.price || 0);
+      const discountPct = Number(item.discountPct || 0);
+      const gross = round2(qty * price);
+      const net = round2(gross - gross * discountPct / 100);
+      const lineTotal = item.lineTotal == null ? null : round2(Number(item.lineTotal));
+      if (lineTotal !== null && Math.abs(lineTotal - net) > 0.05) lineMathMismatchCount += 1;
+      todayRevenue += net;
+      todayCogs += qty * Number(item.costPrice || 0);
+    });
+  });
+  const todayGrossProfit = round2(todayRevenue - todayCogs);
+  const todayExpense = (state.expenses || []).filter(e => e.date === today)
+    .reduce((sum, e) => sum + Number(e.amount || 0), 0);
+  const todayNetProfit = round2(todayGrossProfit - todayExpense);
+
+  const periodFrom = new Date(now);
+  periodFrom.setDate(periodFrom.getDate() - 29);
+  const periodFromStr = `${periodFrom.getFullYear()}-${String(periodFrom.getMonth() + 1).padStart(2, '0')}-${String(periodFrom.getDate()).padStart(2, '0')}`;
+  const periodSales = sales.filter(s => s.date >= periodFromStr && s.date <= today);
+  const moverQty = {};
+  periodSales.forEach(sale => {
+    (sale.items || []).forEach(item => {
+      if (!item.medId) return;
+      moverQty[item.medId] = round2(Number(moverQty[item.medId] || 0) + Number(item.qty || 0));
+    });
+  });
+  const topMovers = Object.keys(moverQty).map(medId => {
+    const med = medicines.find(m => m.id === medId);
+    return { medId, name: med?.brand || med?.name || medId, qty: moverQty[medId] };
+  }).sort((a, b) => b.qty - a.qty).slice(0, 5);
+
+  let periodRevenue = 0;
+  let periodCogs = 0;
+  periodSales.forEach(sale => (sale.items || []).forEach(item => {
+    const gross = Number(item.qty || 0) * Number(item.price || 0);
+    periodRevenue += round2(gross - gross * Number(item.discountPct || 0) / 100);
+    periodCogs += Number(item.qty || 0) * Number(item.costPrice || 0);
+  }));
+  const periodProfit = round2(periodRevenue - periodCogs);
+  const grossMarginPct = periodRevenue > 0 ? round2(periodProfit * 100 / periodRevenue) : 0;
+
+  const lowStock = [];
+  const stockouts = [];
+  inventory.forEach(inv => {
+    const med = medicines.find(m => m.id === inv.medId);
+    const reorder = typeof getEffectiveReorderLevel === 'function'
+      ? getEffectiveReorderLevel(med)
+      : Number(med?.reorderLevel || 10);
+    const stock = Number(inv.totalStock || 0);
+    const name = med?.brand || inv.brand || inv.medId;
+    if (stock <= 0) stockouts.push({ medId: inv.medId, name });
+    else if (stock <= reorder) lowStock.push({ medId: inv.medId, name, stock, reorderLevel: reorder });
+  });
+
+  const expiryAlertDays = Number(state.expiryAlertDays || 90);
+  const baseToday = new Date(now);
+  baseToday.setHours(0, 0, 0, 0);
+  const nearExpiryFefo = [];
+  const expiredBatches = [];
+  inventory.forEach(inv => {
+    const med = medicines.find(m => m.id === inv.medId);
+    (inv.batches || []).forEach(batch => {
+      const expiry = typeof parseExpiryDate === 'function' ? parseExpiryDate(batch.expiry) : null;
+      if (!expiry) return;
+      const daysLeft = Math.ceil((expiry - baseToday) / 86400000);
+      if (Number(batch.stock || 0) <= 0) return;
+      const row = {
+        medId: inv.medId,
+        name: med?.brand || inv.brand || inv.medId,
+        batchId: batch.batchId || '',
+        expiry: batch.expiry || '',
+        stock: Number(batch.stock || 0),
+        daysLeft,
+      };
+      if (daysLeft < 0) expiredBatches.push(row);
+      else if (daysLeft <= expiryAlertDays) nearExpiryFefo.push(row);
+    });
+  });
+  nearExpiryFefo.sort((a, b) => a.daysLeft - b.daysLeft);
+
+  const deadCutoff = new Date(now);
+  deadCutoff.setDate(deadCutoff.getDate() - 180);
+  const lastSold = {};
+  sales.forEach(sale => {
+    const saleDate = new Date(String(sale.date || '') + 'T00:00:00');
+    if (Number.isNaN(saleDate.getTime())) return;
+    (sale.items || []).forEach(item => {
+      if (!item.medId) return;
+      if (!lastSold[item.medId] || saleDate > lastSold[item.medId]) lastSold[item.medId] = saleDate;
+    });
+  });
+  const slowStock = [];
+  const deadStock = [];
+  inventory.forEach(inv => {
+    const stock = Number(inv.totalStock || 0);
+    if (stock <= 0) return;
+    const qtyPeriod = moverQty[inv.medId] || 0;
+    const med = medicines.find(m => m.id === inv.medId);
+    const row = { medId: inv.medId, name: med?.brand || inv.brand || inv.medId, stock };
+    if (qtyPeriod <= 3) slowStock.push(row);
+    if (!lastSold[inv.medId] || lastSold[inv.medId] < deadCutoff) deadStock.push(row);
+  });
+
+  const customerDue = (state.customers || []).reduce((sum, c) => sum + Math.max(0, Number(c.due || 0)), 0);
+  const supplierDue = (state.suppliers || []).reduce((sum, s) =>
+    sum + Math.max(0, Number(s.totalPayable == null ? s.due || 0 : s.totalPayable)), 0);
+
   return {
-    outOfStockCount: m.outStock.length,
-    lowStockCount: m.lowStock.length,
-    expiredMedicineCount: m.expiredItems.length, // ✅ আগে negative daysLeft বাদ পড়ে যেত
-    expiringSoonCount: m.expiryAlerts.filter(x => x.daysLeft >= 0 && x.daysLeft <= 30).length,
-    expiringMediumCount: m.expiryAlerts.filter(x => x.daysLeft > 30 && x.daysLeft <= expiryAlertDays).length, // ✅ নতুন
-    totalCustomerDue: m.totalCustDue,
-    dueCustomerCount: m.dueCustomers.length,
-    todayNetProfit: m.netProfit,
-    todayRevenue: m.netRevenue,
-    todayInvoiceCount: m.invoiceCount,
-    thisMonthProfit: computeMonthlyGrossProfit(thisMonth.fromDate, thisMonth.toDate),
-    lastMonthProfit: computeMonthlyGrossProfit(lastMonth.fromDate, lastMonth.toDate),
+    period: { from: periodFromStr, to: today, days: 30 },
+    today: {
+      revenue: round2(todayRevenue),
+      grossProfit: round2(todayGrossProfit),
+      netProfit: todayNetProfit,
+      invoiceCount: todayInvoiceCount,
+    },
+    periodProfit,
+    grossMarginPct,
+    topMovers,
+    stock: {
+      low: lowStock,
+      lowStockCount: lowStock.length,
+      stockout: stockouts,
+      stockoutCount: stockouts.length,
+      slow: slowStock.slice(0, 10),
+      dead: deadStock.slice(0, 10),
+    },
+    expiry: {
+      nearExpiryFefo: nearExpiryFefo.slice(0, 20),
+      nearExpiryCount: nearExpiryFefo.length,
+      expiredBatches: expiredBatches.slice(0, 20),
+      expiredBatchCount: expiredBatches.length,
+    },
+    dues: {
+      customerDue: round2(customerDue),
+      supplierDue: round2(supplierDue),
+    },
+    invoiceLineMath: {
+      mismatchCount: lineMathMismatchCount,
+      checkedLineCount: todaySales.reduce((sum, sale) =>
+        sum + (sale.items || []).filter(item => item.lineTotal != null).length, 0),
+    },
   };
 }
 
+function buildDeterministicInsightFallback(state) {
+  const m = buildVerifiedInsightMetrics(state);
+  const tips = [];
+  if (m.expiry.expiredBatchCount) tips.push(`মেয়াদউত্তীর্ণ ব্যাচ ${m.expiry.expiredBatchCount}টি—বিক্রির আগে FEFO পরীক্ষা করে আলাদা করুন।`);
+  if (m.stock.stockoutCount) tips.push(`স্টকশূন্য ওষুধ ${m.stock.stockoutCount}টি—আজই reorder তালিকা দেখুন।`);
+  if (m.stock.lowStockCount) tips.push(`স্বল্প-স্টক ওষুধ ${m.stock.lowStockCount}টি—মাত্রা ও reorder level মিলিয়ে ক্রয় করুন।`);
+  if (m.expiry.nearExpiryCount) tips.push(`আগামী ${m.expiry.nearExpiryCount}টি নিকট-মেয়াদি ব্যাচ—FEFO ডিসপ্লে ও প্রচারে গুরুত্ব দিন।`);
+  if (m.dues.customerDue > 0) tips.push(`গ্রাহক বাকি ৳${fmt(m.dues.customerDue)}; নির্ধারিত অগ্রাধিকার অনুযায়ী কোলেকশন পরিকল্পনা করুন।`);
+  if (m.dues.supplierDue > 0) tips.push(`সরবরাহকারী বাকি ৳${fmt(m.dues.supplierDue)}; due date দেখে পরিশোধের পরিকল্পনা করুন।`);
+  tips.push(`আজ বিক্রয় ৳${fmt(m.today.revenue)}, নিট মুনাফা ৳${fmt(m.today.netProfit)}; গত ৩০ দিনে মুনাফার মার্জিন ${m.grossMarginPct} শতাংশ।`);
+  if (m.topMovers.length) tips.push(`সবচেয়ে বেশি বিক্রি: ${m.topMovers.slice(0, 3).map(x => `${x.name} (${x.qty} ইউনিট)`).join(', ')}.`);
+  return tips.join('\n');
+}
+
+function buildAiInsightSummaryPayload(state) {
+  return buildVerifiedInsightMetrics(state);
+}
+
 async function checkAiInsightAvailability() {
-  try {
-    const doc = await userCol('config').doc('aiSettings').get();
-    const settings = doc.exists ? doc.data() : null;
-    const hasRouting = !!(settings && settings.taskRouting && (settings.taskRouting.dashboardInsight || []).length);
-    let allowedForMe = true;
-    if (APP_STATE.isStaffMember) {
-      allowedForMe = APP_STATE.staffRole === 'manager' && settings && settings.staffAccess === 'enabled';
-    }
-    _aiInsightAvailability = { configured: hasRouting, allowedForMe };
-  } catch (err) {
-    _aiInsightAvailability = { configured: false, allowedForMe: !APP_STATE.isStaffMember };
-  }
+  const config = typeof getAiByokConfig === 'function' ? getAiByokConfig() : null;
+  const allowedForMe = !APP_STATE.isStaffMember;
+  _aiInsightAvailability = {
+    configured: !!(config && config.apiKey),
+    allowedForMe,
+  };
   return _aiInsightAvailability;
 }
 
@@ -786,8 +939,11 @@ async function generateAiInsight() {
     await saveAiInsightCache(text);
     renderAiInsightBody({ text, generatedAt: { toDate: () => new Date() } });
   } catch (err) {
+    const fallback = buildDeterministicInsightFallback(APP_STATE);
     box.innerHTML = `
-      <p class="text-xs text-red-500 mb-2"><i class="fa-solid fa-triangle-exclamation mr-1"></i>${esc(humanizeError(err))}</p>
+      <p class="text-xs text-amber-700 mb-2"><i class="fa-solid fa-shield-halved mr-1"></i>AI অফলাইন বা key পাওয়া যায়নি। নিচের নিশ্চিত হিসাব ব্যবহার করুন:</p>
+      <div class="text-sm text-slate-700 dark:text-slate-200 leading-relaxed whitespace-pre-line mb-3">${esc(fallback)}</div>
+      <p class="text-[11px] text-slate-400 mb-2">${esc(humanizeError(err))}</p>
       <button onclick="generateAiInsight()" class="btn btn-secondary btn-sm">আবার চেষ্টা করুন</button>`;
   }
 }

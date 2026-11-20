@@ -6,12 +6,26 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function isSuperAdmin() {
+      return signedIn() && request.auth.uid == 'PGaJOFwnUdWn8bgq0c5JE5aXmit1';
+    }
+
+    function hasActivePlatformBilling(ownerUid) {
+      return isSuperAdmin()
+        || (exists(/databases/$(database)/documents/platformUsers/$(ownerUid))
+          && get(/databases/$(database)/documents/platformUsers/$(ownerUid)).data.status == 'active'
+          && get(/databases/$(database)/documents/platformUsers/$(ownerUid)).data.setupFeePaid == true
+          && get(/databases/$(database)/documents/platformUsers/$(ownerUid)).data.validUntil is timestamp
+          && get(/databases/$(database)/documents/platformUsers/$(ownerUid)).data.validUntil > request.time);
+    }
+
     function isOwner() {
       return signedIn()
         && exists(/databases/$(database)/documents/owners/$(request.auth.uid))
         && get(/databases/$(database)/documents/owners/$(request.auth.uid)).data.uid == request.auth.uid
         && get(/databases/$(database)/documents/owners/$(request.auth.uid)).data.role == 'owner'
-        && get(/databases/$(database)/documents/owners/$(request.auth.uid)).data.email.lower() == request.auth.token.email.lower();
+        && get(/databases/$(database)/documents/owners/$(request.auth.uid)).data.email.lower() == request.auth.token.email.lower()
+        && hasActivePlatformBilling(request.auth.uid);
     }
 
     function staffDoc() {
@@ -26,6 +40,7 @@ service cloud.firestore {
         && staffDoc().email.lower() == request.auth.token.email.lower()
         && staffDoc().ownerUid is string
         && exists(/databases/$(database)/documents/owners/$(staffDoc().ownerUid))
+        && hasActivePlatformBilling(staffDoc().ownerUid)
         && staffDoc().assignedBranchIds is list
         && staffDoc().assignedBranchIds.size() > 0;
     }
@@ -168,8 +183,31 @@ service cloud.firestore {
     }
 
     match /owners/{ownerUid} {
-      allow read: if isOwner() && ownerUid == request.auth.uid;
-      allow create, update, delete: if false;
+      allow get: if isSuperAdmin() || (signedIn() && ownerUid == request.auth.uid);
+      allow list: if isSuperAdmin();
+      allow create, update: if isSuperAdmin()
+        && request.resource.data.uid == ownerUid
+        && request.resource.data.role == 'owner'
+        && request.resource.data.email is string;
+      allow delete: if isSuperAdmin();
+    }
+
+    match /platformUsers/{ownerUid} {
+      allow get: if isSuperAdmin() || (signedIn() && ownerUid == request.auth.uid);
+      allow list: if isSuperAdmin();
+      allow create: if signedIn()
+        && ownerUid == request.auth.uid
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.email is string
+        && request.resource.data.email.lower() == request.auth.token.email.lower()
+        && request.resource.data.status == 'pending'
+        && request.resource.data.setupFeePaid == false
+        && request.resource.data.storeSetupAssistance == false
+        && request.resource.data.keys().hasOnly([
+          'uid', 'email', 'displayName', 'status', 'setupFeePaid',
+          'storeSetupAssistance', 'validUntil', 'createdAt'
+        ]);
+      allow update, delete: if isSuperAdmin();
     }
 
     match /branches/{branchId} {

@@ -1589,6 +1589,14 @@ async function apiGetBalanceSheet() {
 // EXPENSE / SETTINGS / OPENING BALANCE
 // ────────────────────────────────────────────────────────────
 async function apiExecuteBranchTransfer(payload) {
+  if (typeof platformAccessState === 'function' &&
+      APP_STATE.isSuperAdmin !== true &&
+      !platformAccessState(APP_STATE.platformEntitlement).active) {
+    return { success: false, message: `${APP_CONFIG.PLATFORM_NAME} approval / payment সম্পন্ন করুন।` };
+  }
+  if (typeof guardReadOnly === 'function' && guardReadOnly()) {
+    return { success: false, message: 'এই transfer এখন অনুমোদিত নয়।' };
+  }
   if (!navigator.onLine) return { success: false, message: OFFLINE_MSG };
   if (!APP_STATE.isOwner && !hasTransferPermission()) {
     return { success: false, message: 'এই transfer অনুমোদিত নয়।' };

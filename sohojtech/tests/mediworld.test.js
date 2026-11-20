@@ -28,6 +28,7 @@ function createElement() {
     className: '',
     title: '',
     disabled: false,
+    style: {},
     dataset: {},
     classList: {
       add: (...names) => names.forEach(name => classes.add(name)),
@@ -117,6 +118,55 @@ test('all JavaScript files under js/ pass node --check', () => {
     const result = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
     assert.equal(result.status, 0, `${path.relative(projectRoot, file)}\n${result.stderr}`);
   }
+});
+
+test('About Us identifies SojojTech Pharmacy as the platform owner', () => {
+  const { context: app, document } = createSandbox([
+    'js/config.js',
+    'js/utils.js',
+    'js/modules/about.js',
+  ]);
+  app.renderAboutModule();
+  const about = document.getElementById('about-content').innerHTML;
+  assert.match(about, /SojojTech Pharmacy/);
+  assert.match(about, /প্ল্যাটফর্ম মালিক ও পরিচালনাকারী/);
+  assert.match(about, /afsanabintemonnaf@gmail\.com/);
+});
+
+test('workspace identity and invoice top show client business, branch, and address', () => {
+  const { context: app, document } = createSandbox([
+    'js/utils.js',
+    'js/receipt.js',
+    'js/app.js',
+  ], {
+    APP_STATE: {
+      pharmacyName: 'Client Pharmacy',
+      address: 'Fallback address',
+      activeBranchId: 'branch-1',
+      branches: [{ id: 'branch-1', name: 'Uttara Branch', address: 'Road 5, Dhaka' }],
+    },
+  });
+  app.renderWorkspaceBusinessIdentity();
+  const workspace = document.getElementById('workspace-business-identity').innerHTML;
+  assert.match(workspace, /Client Pharmacy/);
+  assert.match(workspace, /Uttara Branch/);
+  assert.match(workspace, /Road 5, Dhaka/);
+
+  const receipt = app.buildReceiptConfig('sale', {
+    branchId: 'branch-1',
+    invoiceNo: 'INV-1',
+    date: '2026-11-20',
+    items: [],
+    totalBill: 0,
+    cashPaid: 0,
+    due: 0,
+  });
+  assert.equal(receipt.pharmacy.name, 'Client Pharmacy');
+  assert.equal(receipt.pharmacy.branchName, 'Uttara Branch');
+  assert.equal(receipt.pharmacy.address, 'Road 5, Dhaka');
+  const html = app.buildReceiptHTMLContent(receipt);
+  assert.ok(html.indexOf('Client Pharmacy') < html.indexOf('Uttara Branch'));
+  assert.ok(html.indexOf('Uttara Branch') < html.indexOf('Road 5, Dhaka'));
 });
 
 test('direct-unit formatting and inventory valuation use FEFO and reject invalid numbers', () => {
@@ -591,6 +641,9 @@ test('HTML loads app scripts in dependency order and CSS preserves mobile line v
 test('Firestore rules retain owner/staff role, branch, collection and deny-by-default guards', () => {
   const rules = fs.readFileSync(path.join(projectRoot, 'firestore.rules'), 'utf8');
   assert.match(rules, /rules_version\s*=\s*'2'/);
+  assert.match(rules, /function isSuperAdmin\(\)/);
+  assert.match(rules, /function hasActivePlatformBilling\(ownerUid\)/);
+  assert.match(rules, /match \/platformUsers\/\{ownerUid\}[\s\S]*?allow update, delete: if isSuperAdmin\(\)/);
   assert.match(rules, /function isOwner\(\)[\s\S]*?\.data\.role == 'owner'/);
   assert.match(rules, /function isActiveStaff\(\)[\s\S]*?staffDoc\(\)\.active == true[\s\S]*?staffDoc\(\)\.status == 'active'/);
   assert.match(rules, /request\.resource\.data\.role in \['manager', 'cashier'\]/);
@@ -607,4 +660,469 @@ test('Firestore rules retain owner/staff role, branch, collection and deny-by-de
   assert.match(rules, /match \/audits\/\{auditId\}[\s\S]*?allow update, delete: if false/);
   assert.match(rules, /match \/transfers\/\{transferId\}[\s\S]*?allow update, delete: if false/);
   assert.match(rules, /match \/\{document=\*\*\}[\s\S]*?allow read, write: if false/);
+});
+
+test('Firebase deploy config includes both Transfer Ledger composite indexes', () => {
+  const firebaseConfig = JSON.parse(fs.readFileSync(path.join(projectRoot, 'firebase.json'), 'utf8'));
+  const indexes = JSON.parse(fs.readFileSync(path.join(projectRoot, 'firestore.indexes.json'), 'utf8'));
+  assert.equal(firebaseConfig.firestore.indexes, 'firestore.indexes.json');
+  const fields = indexes.indexes.map(index => index.fields.map(field =>
+    `${field.fieldPath}:${field.order}`).join(','));
+  assert.deepEqual(fields, [
+    'sourceBranchId:ASCENDING,createdAt:DESCENDING',
+    'targetBranchId:ASCENDING,createdAt:DESCENDING',
+  ]);
+});
+
+test('BYOK client rejects missing key and proxy settings remain strictly key-based', async () => {
+  const { context: app } = createSandbox(['js/ui-components.js', 'js/ai-service.js'], {
+    APP_STATE: { isOwner: true, isStaffMember: false, readOnly: false },
+    toast() {},
+  });
+  await assert.rejects(() => app.callAiTask('dashboardInsight', {}), /BYOK নয়|নিজের Apps Script/);
+  app.saveAiByokConfig({
+    proxyUrl: 'https://script.google.com/macros/s/test/exec',
+    provider: 'gemini',
+    apiKey: 'test-secret-key-1234567890',
+  });
+  assert.equal(app.getAiByokConfig().apiKey, 'test-secret-key-1234567890');
+  app.clearAiByokConfig();
+  await assert.rejects(() => app.callAiTask('dashboardInsight', {}), /BYOK নয়/);
+
+  const proxy = fs.readFileSync(path.join(projectRoot, 'AiProxy.gs'), 'utf8');
+  assert.doesNotMatch(proxy, /PropertiesService\.getScriptProperties\(\).*apiKey/);
+  assert.doesNotMatch(proxy, /console\.log|Logger\.log/);
+  assert.match(proxy, /MISSING_KEY/);
+});
+
+test('Firebase BYOK config validation rejects incomplete config and accepts isolated project config', () => {
+  const { context: app } = createSandbox(['js/ui-components.js', 'js/config.js'], {
+    APP_STATE: { isOwner: true, isStaffMember: false, readOnly: false },
+    toast() {},
+  });
+  assert.equal(app.validateFirebaseByokConfig({}).valid, false);
+  const config = {
+    apiKey: 'AIza-test-key',
+    authDomain: 'pharmacy.firebaseapp.com',
+    projectId: 'pharmacy-business',
+    storageBucket: 'pharmacy-business.appspot.com',
+    messagingSenderId: '123456789',
+    appId: '1:123456789:web:abcdef',
+  };
+  const accepted = app.validateFirebaseByokConfig(config);
+  assert.equal(accepted.valid, true);
+  app.saveFirebaseByokConfig(config);
+  assert.equal(app.getFirebaseByokConfig().projectId, 'pharmacy-business');
+  app.clearFirebaseByokConfig();
+  assert.equal(app.getFirebaseByokConfig(), null);
+});
+
+test('Settings, AI Settings, and Firebase BYOK are strictly Owner-only', async () => {
+  const staffToast = [];
+  const staffSettings = createSandbox([
+    'js/config.js',
+    'js/utils.js',
+    'js/ui-components.js',
+    'js/modules/settings.js',
+  ], {
+    APP_STATE: { isOwner: false, isStaffMember: true, readOnly: false, isAdmin: false },
+    toast(message) { staffToast.push(String(message)); },
+  });
+  staffSettings.document.getElementById('settings-content');
+  staffSettings.context.renderSettingsModule();
+  assert.match(staffSettings.elements.get('settings-content').innerHTML, /শুধু মালিক Settings/);
+  await staffSettings.context.saveSettingsForm();
+
+  const ownerSettings = createSandbox([
+    'js/config.js',
+    'js/utils.js',
+    'js/ui-components.js',
+    'js/modules/settings.js',
+  ], {
+    APP_STATE: { isOwner: true, isStaffMember: false, readOnly: false, isAdmin: true },
+    toast() {},
+  });
+  ownerSettings.context.renderSettingsModule();
+  assert.doesNotMatch(ownerSettings.elements.get('settings-content').innerHTML, /শুধু মালিক Settings/);
+
+  const staffAi = createSandbox([
+    'js/utils.js',
+    'js/ui-components.js',
+    'js/ai-service.js',
+    'js/modules/ai-settings.js',
+  ], {
+    APP_STATE: { isOwner: false, isStaffMember: true, readOnly: false },
+    toast(message) { staffToast.push(String(message)); },
+  });
+  staffAi.context.renderAiSettingsModule();
+  assert.match(staffAi.elements.get('aiSettings-content').innerHTML, /শুধু মালিক AI BYOK/);
+  assert.doesNotThrow(() => staffAi.context.clearAiByok());
+  assert.equal(staffAi.context.getAiByokConfig(), null);
+
+  const staffFirebase = createSandbox([
+    'js/utils.js',
+    'js/ui-components.js',
+    'js/config.js',
+  ], {
+    APP_STATE: { isOwner: false, isStaffMember: true, readOnly: false },
+    toast(message) { staffToast.push(String(message)); },
+  });
+  const firebaseConfig = {
+    apiKey: 'AIza-test-key',
+    authDomain: 'pharmacy.firebaseapp.com',
+    projectId: 'pharmacy-business',
+    storageBucket: 'pharmacy-business.appspot.com',
+    messagingSenderId: '123456789',
+    appId: '1:123456789:web:abcdef',
+  };
+  assert.throws(
+    () => staffFirebase.context.saveFirebaseByokConfig(firebaseConfig),
+    /শুধু মালিক/,
+  );
+  assert.throws(
+    () => staffFirebase.context.clearFirebaseByokConfig(),
+    /শুধু মালিক/,
+  );
+});
+
+test('Platform User Management is Super Admin-only in the renderer and action handlers', async () => {
+  const calls = [];
+  const regularOwner = createSandbox([
+    'js/config.js',
+    'js/utils.js',
+    'js/modules/admin.js',
+  ], {
+    APP_STATE: {
+      isOwner: true,
+      isAdmin: false,
+      isSuperAdmin: false,
+      currentUser: { uid: 'pharmacy-owner', email: 'owner@example.test' },
+    },
+    fbDb: { collection() { calls.push('read'); throw new Error('must not read platform users'); } },
+    toast(message) { calls.push(message); },
+  });
+  await regularOwner.context.renderAdminModule();
+  await regularOwner.context.approvePlatformUser('victim');
+  await regularOwner.context.revokePlatformUser('victim');
+  assert.match(regularOwner.elements.get('admin-content').innerHTML, /শুধু Super Admin/);
+  assert.equal(calls.includes('read'), false);
+  assert.ok(calls.some(message => /শুধু Super Admin/.test(String(message))));
+
+  const rootAdmin = createSandbox([
+    'js/config.js',
+    'js/utils.js',
+    'js/modules/admin.js',
+  ], {
+    APP_STATE: {
+      isOwner: true,
+      isAdmin: true,
+      isSuperAdmin: true,
+      currentUser: { uid: 'PGaJOFwnUdWn8bgq0c5JE5aXmit1' },
+    },
+    fbDb: {
+      collection() {
+        return { get: async () => ({ docs: [{
+          id: 'client-1',
+          data: () => ({ uid: 'client-1', email: 'client@example.test', status: 'pending' }),
+        }] }) };
+      },
+    },
+    toast() {},
+  });
+  await rootAdmin.context.renderAdminModule();
+  assert.match(rootAdmin.elements.get('admin-content').innerHTML, /Approve \/ Accept/);
+});
+
+test('platform setup and maintenance fee calculations and entitlement gating are exact', () => {
+  const { context: app } = createSandbox(['js/config.js']);
+  const now = Date.UTC(2026, 10, 20);
+  const pending = app.platformAccessState({ status: 'pending', setupFeePaid: false }, now);
+  const addOn = app.platformAccessState({
+    status: 'active', setupFeePaid: true, storeSetupAssistance: true,
+    validUntil: new Date(now + 86400000),
+  }, now);
+  assert.equal(pending.setupFee, 10000);
+  assert.equal(addOn.setupFee, 15000);
+  assert.equal(pending.monthlyFee, 1500);
+  assert.equal(pending.active, false);
+  assert.equal(app.platformAccessState({
+    status: 'active', setupFeePaid: false, validUntil: new Date(now + 86400000),
+  }, now).active, false);
+  assert.equal(app.platformAccessState({
+    status: 'active', setupFeePaid: true, validUntil: new Date(now - 1),
+  }, now).reason, 'expired');
+  assert.equal(app.platformAccessState({
+    status: 'revoked', setupFeePaid: true, validUntil: new Date(now + 86400000),
+  }, now).reason, 'revoked');
+  assert.equal(addOn.active, true);
+
+  const guardedApp = createSandbox(['js/config.js', 'js/app.js'], {
+    APP_STATE: {
+      isOwner: true,
+      isSuperAdmin: false,
+      currentUser: { uid: 'pharmacy-owner' },
+      platformEntitlement: { status: 'pending', setupFeePaid: false },
+      currentTab: 'settings',
+    },
+  });
+  assert.equal(guardedApp.context.canAccessTab('pos'), false);
+  assert.equal(guardedApp.context.canAccessTab('settings'), true);
+  guardedApp.context.APP_STATE.platformEntitlement = {
+    status: 'active', setupFeePaid: true, validUntil: new Date(Date.now() + 86400000),
+  };
+  assert.equal(guardedApp.context.canAccessTab('pos'), true);
+  assert.equal(guardedApp.context.canAccessTab('admin'), false);
+});
+
+test('approval, revocation and payment updates use Super Admin guarded handlers', async () => {
+  const writes = [];
+  const admin = createSandbox([
+    'js/config.js',
+    'js/utils.js',
+    'js/modules/admin.js',
+  ], {
+    APP_STATE: {
+      isOwner: true,
+      isAdmin: true,
+      isSuperAdmin: true,
+      currentUser: { uid: 'PGaJOFwnUdWn8bgq0c5JE5aXmit1' },
+    },
+    firebase: {
+      firestore: {
+        FieldValue: { serverTimestamp: () => 'server-time' },
+        Timestamp: { fromDate: date => date },
+      },
+    },
+    fbDb: {
+      collection(name) {
+        return {
+          doc(uid) {
+            return {
+              name,
+              uid,
+              get: async () => ({ exists: true, data: () => ({ email: 'owner@example.test', status: 'pending' }) }),
+              update: async patch => writes.push({ type: 'update', name, uid, patch }),
+            };
+          },
+          get: async () => ({ docs: [] }),
+        };
+      },
+      batch() {
+        return {
+          update: (ref, data) => writes.push({ type: 'batch-update', ref, data }),
+          set: (ref, data) => writes.push({ type: 'batch-set', ref, data }),
+          commit: async () => {},
+        };
+      },
+    },
+    prompt: () => 'billing issue',
+    toast() {},
+  });
+  await admin.context.approvePlatformUser('client-1');
+  assert.ok(writes.some(write => write.type === 'batch-update' && write.data.status === 'active'));
+  await admin.context.revokePlatformUser('client-1');
+  assert.ok(writes.some(write => write.type === 'update' &&
+    write.patch.status === 'revoked' && write.patch.revocationNote === 'billing issue'));
+  const januaryEnd = admin.context.addUtcMonth(Date.UTC(2025, 0, 31));
+  assert.equal(januaryEnd.toISOString(), '2025-02-28T00:00:00.000Z');
+
+  let paymentUpdate;
+  admin.context.firebase.firestore.FieldValue.arrayUnion = (...items) => ({ arrayUnion: items });
+  admin.context.fbDb.runTransaction = async callback => callback({
+    get: async () => ({
+      exists: true,
+      data: () => ({ status: 'active', setupFeePaid: true, validUntil: new Date() }),
+    }),
+    update: (_ref, patch) => { paymentUpdate = patch; },
+  });
+  const beforePayment = Date.now();
+  await admin.context.recordPlatformMonthlyPayment('client-1');
+  assert.equal(paymentUpdate.status, 'active');
+  assert.equal(paymentUpdate.paymentHistory.arrayUnion[0].amount, 1500);
+  assert.ok(paymentUpdate.validUntil.getTime() >= beforePayment + 27 * 86400000);
+});
+
+test('setup-fee and add-on actions never clear a revoked status', async () => {
+  let user = { status: 'revoked', setupFeePaid: true, storeSetupAssistance: false };
+  const { context: admin } = createSandbox([
+    'js/config.js',
+    'js/utils.js',
+    'js/modules/admin.js',
+  ], {
+    APP_STATE: {
+      isOwner: true,
+      isAdmin: true,
+      isSuperAdmin: true,
+      currentUser: { uid: 'PGaJOFwnUdWn8bgq0c5JE5aXmit1' },
+    },
+    firebase: {
+      firestore: {
+        FieldValue: {
+          serverTimestamp: () => 'server-time',
+          arrayUnion: (...items) => ({ arrayUnion: items }),
+        },
+        Timestamp: { fromDate: date => date },
+      },
+    },
+    fbDb: {
+      collection() {
+        return {
+          doc() {
+            return {
+              get: async () => ({ exists: true, data: () => user }),
+              update: async patch => { user = { ...user, ...patch }; },
+            };
+          },
+          get: async () => ({ docs: [] }),
+        };
+      },
+      runTransaction: async callback => callback({
+        get: async () => ({ exists: true, data: () => user }),
+        update: (_ref, patch) => { user = { ...user, ...patch }; },
+      }),
+    },
+    toast() {},
+  });
+  await admin.togglePlatformStoreSetup('client', false);
+  assert.equal(user.status, 'revoked');
+  await admin.setPlatformSetupFeePaid('client', true);
+  assert.equal(user.status, 'revoked');
+  await admin.recordPlatformMonthlyPayment('client');
+  assert.equal(user.status, 'revoked');
+});
+
+test('Owner Firebase config is saved locally but remains ineffective before approval and billing', () => {
+  const { context: app, elements } = createSandbox([
+    'js/config.js',
+    'js/utils.js',
+    'js/ui-components.js',
+    'js/modules/settings.js',
+  ], {
+    APP_STATE: {
+      isOwner: true,
+      isStaffMember: false,
+      isSuperAdmin: false,
+      readOnly: true,
+      currentUser: { uid: 'pharmacy-owner' },
+      platformEntitlement: { status: 'pending', setupFeePaid: false },
+    },
+    toast() {},
+  });
+  app.renderSettingsModule();
+  assert.match(elements.get('settings-content').innerHTML, /Approval \/ Payment Required/);
+  assert.match(elements.get('settings-content').innerHTML, /Authorized domains/);
+  const config = {
+    apiKey: 'AIza-test-key',
+    authDomain: 'pharmacy.firebaseapp.com',
+    projectId: 'pharmacy-business',
+    storageBucket: 'pharmacy-business.appspot.com',
+    messagingSenderId: '123456789',
+    appId: '1:123456789:web:abcdef',
+  };
+  app.saveFirebaseByokConfig(config);
+  assert.equal(app.getFirebaseByokConfig().projectId, 'pharmacy-business');
+  assert.equal(app.getEffectiveFirebaseConfig().projectId, 'mediworld-bd-test');
+  app.APP_STATE.platformEntitlement = {
+    status: 'active',
+    setupFeePaid: true,
+    validUntil: new Date(Date.now() + 86400000),
+  };
+  assert.equal(app.getEffectiveFirebaseConfig().projectId, 'pharmacy-business');
+});
+
+test('BYOK AI calls the selected provider directly first and only uses optional per-user fallback', async () => {
+  const requests = [];
+  const { context: app } = createSandbox(['js/ai-service.js'], {
+    APP_STATE: { isOwner: true, isStaffMember: false },
+    APP_CONFIG: { aiProxyFallbackUrl: 'https://script.google.com/macros/s/default/exec' },
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      if (url.startsWith('https://generativelanguage.googleapis.com')) {
+        return { ok: false, json: async () => ({ error: { message: 'provider unavailable' } }) };
+      }
+      return { ok: true, json: async () => ({ success: true, provider: 'gemini', data: { tips: ['ok'] } }) };
+    },
+    toast() {},
+  });
+  const apiKey = 'owner-only-api-key-1234567890';
+  app.saveAiByokConfig({
+    provider: 'gemini',
+    apiKey,
+    proxyUrl: 'https://script.google.com/macros/s/client-owned/exec',
+  });
+  const result = await app.callAiTask('dashboardInsight', { summary: {} });
+  assert.equal(result.success, true);
+  assert.match(requests[0].url, /generativelanguage\.googleapis\.com/);
+  assert.match(requests[1].url, /client-owned\/exec/);
+  assert.equal(requests[0].options.headers['x-goog-api-key'], apiKey);
+  assert.equal(JSON.parse(requests[1].options.body).apiKey, apiKey);
+  assert.equal(app.getAiByokConfig().apiKey, apiKey);
+  app.saveAiByokConfig({ provider: 'gemini', apiKey, proxyUrl: '' });
+  await app.callAiTask('dashboardInsight', { summary: {} });
+  assert.match(requests[3].url, /default\/exec/);
+  assert.equal(JSON.parse(requests[3].options.body).apiKey, apiKey);
+  app.APP_STATE.readOnly = true;
+  await assert.rejects(() => app.callAiTask('dashboardInsight', {}), /Approval \/ Payment Required/);
+  assert.equal(requests.length, 4);
+});
+
+test('verified insight aggregator computes deterministic totals, stock, expiry and dues', () => {
+  const { context: app } = createSandbox(['js/utils.js', 'js/modules/dashboard.js'], {
+    APP_STATE: {
+      medicines: [{ id: 'm1', brand: 'Napa', reorderLevel: 5 }],
+      inventory: [{
+        medId: 'm1', brand: 'Napa', totalStock: 3,
+        costValue: 30, mrpValue: 60,
+        batches: [{ batchId: 'b1', expiry: '12/2026', stock: 3, cost: 10, mrp: 20 }],
+      }],
+      sales: [{
+        date: '2026-11-20', items: [
+          { medId: 'm1', qty: 2, price: 20, costPrice: 10, discountPct: 10, lineTotal: 36 },
+        ],
+      }],
+      expenses: [{ date: '2026-11-20', amount: 5 }],
+      customers: [{ due: 100 }, { due: 50 }],
+      suppliers: [{ totalPayable: 75 }],
+    },
+  });
+  const verified = app.buildVerifiedInsightMetrics(app.APP_STATE, new Date('2026-11-20T12:00:00'));
+  assert.equal(verified.today.revenue, 36);
+  assert.equal(verified.today.grossProfit, 16);
+  assert.equal(verified.today.netProfit, 11);
+  assert.equal(verified.stock.lowStockCount, 1);
+  assert.equal(verified.dues.customerDue, 150);
+  assert.equal(verified.dues.supplierDue, 75);
+  assert.equal(verified.invoiceLineMath.mismatchCount, 0);
+  assert.ok(Array.isArray(verified.topMovers));
+});
+
+test('prescription item verification matches local inventory and rejects ambiguous or unavailable items', () => {
+  const { context: app } = createSandbox(['js/utils.js', 'js/modules/pos.js'], {
+    APP_STATE: {
+      medicines: [
+        { id: 'm1', brand: 'Napa 500', generic: 'Paracetamol', doseForm: 'Tablet', strength: '500mg' },
+        { id: 'm2', brand: 'Napa Extend', generic: 'Paracetamol', doseForm: 'Tablet', strength: '665mg' },
+      ],
+      inventory: [{
+        medId: 'm1', brand: 'Napa 500', totalStock: 10,
+        batches: [{ batchId: 'b1', expiry: '12/2027', stock: 10 }],
+      }, {
+        medId: 'm2', brand: 'Napa Extend', totalStock: 0,
+        batches: [{ batchId: 'b2', expiry: '12/2027', stock: 0 }],
+      }],
+    },
+  });
+  const verified = app.verifyPrescriptionItemAgainstInventory({
+    possibleName: 'Napa',
+    strength: '500mg',
+  }, app.APP_STATE);
+  assert.equal(verified.status, 'verified');
+  assert.equal(verified.candidate.medId, 'm1');
+  assert.equal(verified.stock, 10);
+
+  const unavailable = app.verifyPrescriptionItemAgainstInventory({
+    possibleName: 'Napa Extend',
+  }, app.APP_STATE);
+  assert.equal(unavailable.status, 'unavailable');
+  assert.equal(unavailable.stock, 0);
 });

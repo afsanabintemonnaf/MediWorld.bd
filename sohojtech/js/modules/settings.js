@@ -7,6 +7,29 @@
 function renderSettingsModule() {
   const c = document.getElementById('settings-content');
   if (!c) return;
+  if (!APP_STATE.isOwner) {
+    c.innerHTML = '<div class="bg-white dark:bg-slate-800 border border-red-200 dark:border-red-800 rounded-xl p-8 text-center"><i class="fa-solid fa-user-shield text-2xl text-red-500 mb-3"></i><p class="text-sm font-semibold text-red-600">শুধু মালিক Settings, export/import, reset এবং Firebase BYOK সেটিংস দেখতে বা পরিবর্তন করতে পারবেন।</p></div>';
+    return;
+  }
+
+  if (APP_STATE.isSuperAdmin !== true &&
+      !platformAccessState(APP_STATE.platformEntitlement).active) {
+    c.innerHTML = `
+      <div class="bg-red-50 dark:bg-red-900/20 border border-red-300 dark:border-red-700 rounded-xl p-5 mb-4">
+        <h3 class="font-bold text-red-700 dark:text-red-300">${esc(APP_CONFIG.PLATFORM_NAME)} — Approval / Payment Required — অনুমোদন / পেমেন্ট প্রয়োজন</h3>
+        <p class="text-sm mt-2">অ্যাকাউন্টের অবস্থা: <strong>${esc(platformAccessState(APP_STATE.platformEntitlement).reason)}</strong>। অনুমোদন, সেটআপ ফি ও বৈধ মাসিক পেমেন্ট ছাড়া ফার্মেসির মূল ফিচার ব্যবহার করা যাবে না।</p>
+        <ul class="text-sm mt-2 list-disc pl-5">
+          <li>এককালীন সেটআপ: ৳১০,০০০</li>
+          <li>ঐচ্ছিক Store setup assistance: +৳৫,০০০</li>
+          <li>মাসিক মেইনটেন্যান্স: ৳১,৫০০/মাস</li>
+        </ul>
+        <p class="text-sm mt-2">${esc(APP_CONFIG.PLATFORM_NAME)} যোগাযোগ: ${esc(APP_CONFIG.SUPPORT_PHONE)} · ${esc(APP_CONFIG.OWNER_EMAIL)}</p>
+      </div>
+      ${renderFirebaseSetupWizard()}
+    `;
+    hydrateFirebaseByokForm();
+    return;
+  }
 
   c.innerHTML = `
     <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
@@ -56,6 +79,29 @@ function renderSettingsModule() {
             <span class="w-2 h-2 rounded-full bg-slate-300 animate-pulse"></span> লোড হচ্ছে...
           </div>
         </div>
+
+        ${APP_STATE.isOwner ? `
+        <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5">
+          <h5 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-2 flex items-center gap-2"><i class="fa-solid fa-fire text-orange-500"></i>নিজের Firebase প্রজেক্ট (BYOK)</h5>
+          <p class="text-xs mb-2">${renderFirebaseByokBadge()}</p>
+          <p class="text-[11px] text-slate-400 mb-3">Platform Google login আলাদা থাকবে। নিজের Firebase Web config এখানে যাচাই ও সংরক্ষণ করুন; Super Admin approval ও active billing-এর আগে Client config কার্যকর হবে না।</p>
+          <div class="grid grid-cols-1 gap-2">
+            <input id="firebase-byok-api-key" placeholder="Firebase Web API Key" class="px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700"/>
+            <input id="firebase-byok-auth-domain" placeholder="authDomain (যেমন: pharmacy.firebaseapp.com)" class="px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700"/>
+            <input id="firebase-byok-project-id" placeholder="Project ID" class="px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700"/>
+            <input id="firebase-byok-storage" placeholder="Storage Bucket (ঐচ্ছিক)" class="px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700"/>
+            <input id="firebase-byok-sender" placeholder="Messaging Sender ID" class="px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700"/>
+            <input id="firebase-byok-app-id" placeholder="Firebase App ID" class="px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700"/>
+          </div>
+          <div class="flex gap-2 mt-3">
+            <button onclick="testFirebaseByokConfig()" class="btn btn-brand-outline btn-sm">সংযোগ টেস্ট</button>
+            <button onclick="saveFirebaseByokConfigForm()" class="btn btn-primary btn-sm">সেভ করুন</button>
+            <button onclick="clearFirebaseByokConfigForm()" class="btn btn-secondary btn-sm">Platform প্রজেক্টে ফিরে যান</button>
+          </div>
+          <div id="firebase-byok-status" class="text-xs mt-2"></div>
+          ${renderFirebaseSetupGuide()}
+          <p class="text-[11px] text-amber-700 dark:text-amber-400 mt-3">Firebase Console → Authentication → Settings → Authorized domains-এ PWA URL-এর domain যোগ করুন। Firestore rules deploy না করলে Owner/Staff login বা ডেটা অস্বীকৃত হবে।</p>
+        </div>` : ''}
 
         <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5">
           <h5 class="text-sm font-semibold text-slate-700 dark:text-slate-200 mb-3 flex items-center gap-2"><i class="fa-solid fa-cloud text-slate-400"></i> অফলাইন সিঙ্ক স্ট্যাটাস</h5>
@@ -149,6 +195,202 @@ function renderSettingsModule() {
   refreshCashBalanceCard();
   if (!APP_STATE.isStaffMember) refreshEmailPrefCard();
   if (!APP_STATE.isStaffMember) refreshPinLockCard();
+  hydrateFirebaseByokForm();
+}
+
+function renderFirebaseSetupWizard() {
+  return `
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5">
+      <h3 class="font-semibold mb-2"><i class="fa-solid fa-fire text-orange-500 mr-2"></i>Client Database Setup Guide &amp; Controls</h3>
+      <p class="text-xs text-slate-500 mb-3">${renderFirebaseByokBadge()}</p>
+      ${renderFirebaseByokFields()}
+      <div class="flex flex-wrap gap-2 mt-3">
+        <button onclick="testFirebaseByokConfig()" class="btn btn-brand-outline btn-sm">সংযোগ টেস্ট</button>
+        <button onclick="saveFirebaseByokConfigForm()" class="btn btn-primary btn-sm">সেভ করুন</button>
+        <button onclick="copyFirebaseConfig()" class="btn btn-secondary btn-sm">firebaseConfig কপি</button>
+      </div>
+      <div id="firebase-byok-status" class="text-xs mt-2"></div>
+      ${renderFirebaseSetupGuide()}
+    </div>`;
+}
+
+function renderFirebaseByokFields() {
+  return `<div class="grid grid-cols-1 md:grid-cols-2 gap-2">
+    <input id="firebase-byok-api-key" placeholder="Firebase Web API Key" class="px-3 py-2 text-sm border rounded-lg bg-white dark:bg-slate-700"/>
+    <input id="firebase-byok-auth-domain" placeholder="authDomain (pharmacy.firebaseapp.com)" class="px-3 py-2 text-sm border rounded-lg bg-white dark:bg-slate-700"/>
+    <input id="firebase-byok-project-id" placeholder="Project ID" class="px-3 py-2 text-sm border rounded-lg bg-white dark:bg-slate-700"/>
+    <input id="firebase-byok-storage" placeholder="Storage Bucket (ঐচ্ছিক)" class="px-3 py-2 text-sm border rounded-lg bg-white dark:bg-slate-700"/>
+    <input id="firebase-byok-sender" placeholder="Messaging Sender ID" class="px-3 py-2 text-sm border rounded-lg bg-white dark:bg-slate-700"/>
+    <input id="firebase-byok-app-id" placeholder="Firebase App ID" class="px-3 py-2 text-sm border rounded-lg bg-white dark:bg-slate-700"/>
+  </div>`;
+}
+
+function renderFirebaseSetupGuide() {
+  return `<ol class="mt-4 space-y-2 text-xs text-slate-600 dark:text-slate-300 list-decimal pl-5">
+    <li>Firebase Console-এ নতুন Project তৈরি করুন; প্রজেক্টে Firestore Database তৈরি করুন।</li>
+    <li>Authentication → Sign-in method-এ Google চালু করুন। Settings → Authorized domains-এ <code>${esc(typeof location !== 'undefined' ? location.hostname : 'আপনার-app-domain')}</code> যোগ করুন। <button onclick="copyFirebaseAppDomain()" class="text-brand underline">App domain কপি</button></li>
+    <li>Project settings → Your apps → Web app থেকে <code>firebaseConfig</code> কপি করে উপরের ঘরগুলো পূরণ করুন। <button onclick="copyFirebaseConfig()" class="text-brand underline">কনফিগ কপি</button></li>
+    <li>Firestore → Rules-এ প্রজেক্টের <code>firestore.rules</code> প্রয়োগ ও Publish করুন। <button onclick="copyFirebaseRules()" class="text-brand underline">Rules কপি</button></li>
+    <li>Firestore → Indexes → Composite → Create index-এ collection <code>transfers</code> দিয়ে <code>sourceBranchId Ascending + createdAt Descending</code> এবং <code>targetBranchId Ascending + createdAt Descending</code> index তৈরি করুন। <button onclick="copyTransferIndexes()" class="text-brand underline">Index JSON কপি</button></li>
+    <li>সংযোগ টেস্ট সফল হলে সেভ করুন। কনফিগ এখন শুধু এই ডিভাইসে pending অবস্থায় থাকবে; Super Admin অনুমোদন, সেটআপ ফি ও সক্রিয় মাসিক মেয়াদ না হওয়া পর্যন্ত এটি কার্যকর হবে না।</li>
+  </ol>`;
+}
+
+function renderFirebaseByokBadge() {
+  const saved = getFirebaseByokConfig();
+  const active = APP_STATE.isSuperAdmin === true ||
+    platformAccessState(APP_STATE.platformEntitlement).active;
+  return active
+    ? '🟢 Super Admin অনুমোদন ও billing সক্রিয় — Client config কার্যকর'
+    : saved
+      ? '🟡 কনফিগ সেভ আছে — Super Admin অনুমোদনের অপেক্ষায়; এখনো কার্যকর নয়'
+      : '⚪ কনফিগ এখনো সেভ হয়নি';
+}
+
+function requireFirebaseSetupOwner() {
+  if (APP_STATE.isOwner === true && APP_STATE.isStaffMember !== true) return false;
+  toast('Firebase BYOK সেটআপ শুধু Owner করতে পারবেন।', 'e');
+  return true;
+}
+
+async function copyFirebaseConfig() {
+  if (requireFirebaseSetupOwner()) return;
+  try {
+    const config = validateFirebaseByokConfig(readFirebaseByokForm());
+    if (!config.valid) throw new Error(config.message);
+    await navigator.clipboard.writeText('const firebaseConfig = ' +
+      JSON.stringify(config.config, null, 2) + ';');
+    setFirebaseByokStatus('firebaseConfig কপি হয়েছে।', 's');
+  } catch (err) {
+    setFirebaseByokStatus('কপি ব্যর্থ: ' + humanizeError(err), 'e');
+  }
+}
+
+async function copyFirebaseAppDomain() {
+  if (requireFirebaseSetupOwner()) return;
+  try {
+    const domain = typeof location !== 'undefined' ? location.hostname : '';
+    if (!domain) throw new Error('App domain নির্ধারণ করা যায়নি।');
+    await navigator.clipboard.writeText(domain);
+    setFirebaseByokStatus('Authorized Domains-এর জন্য app domain কপি হয়েছে।', 's');
+  } catch (err) {
+    setFirebaseByokStatus('Domain কপি ব্যর্থ: ' + humanizeError(err), 'e');
+  }
+}
+
+async function copyFirebaseRules() {
+  if (requireFirebaseSetupOwner()) return;
+  try {
+    const response = await fetch('firestore.rules');
+    if (!response.ok) throw new Error('Firestore Rules ফাইল লোড হয়নি।');
+    await navigator.clipboard.writeText(await response.text());
+    setFirebaseByokStatus('Firestore Rules কপি হয়েছে। Console-এ Rules editor-এ বসিয়ে Publish করুন।', 's');
+  } catch (err) {
+    setFirebaseByokStatus('Rules কপি ব্যর্থ: ' + humanizeError(err), 'e');
+  }
+}
+
+async function copyTransferIndexes() {
+  if (requireFirebaseSetupOwner()) return;
+  const indexes = {
+    indexes: [
+      { collectionGroup: 'transfers', queryScope: 'COLLECTION', fields: [
+        { fieldPath: 'sourceBranchId', order: 'ASCENDING' },
+        { fieldPath: 'createdAt', order: 'DESCENDING' },
+      ] },
+      { collectionGroup: 'transfers', queryScope: 'COLLECTION', fields: [
+        { fieldPath: 'targetBranchId', order: 'ASCENDING' },
+        { fieldPath: 'createdAt', order: 'DESCENDING' },
+      ] },
+    ],
+    fieldOverrides: [],
+  };
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(indexes, null, 2));
+    setFirebaseByokStatus('Transfer Ledger composite indexes কপি হয়েছে।', 's');
+  } catch (err) {
+    setFirebaseByokStatus('Index কপি ব্যর্থ: ' + humanizeError(err), 'e');
+  }
+}
+
+function readFirebaseByokForm() {
+  return {
+    apiKey: document.getElementById('firebase-byok-api-key')?.value || '',
+    authDomain: document.getElementById('firebase-byok-auth-domain')?.value || '',
+    projectId: document.getElementById('firebase-byok-project-id')?.value || '',
+    storageBucket: document.getElementById('firebase-byok-storage')?.value || '',
+    messagingSenderId: document.getElementById('firebase-byok-sender')?.value || '',
+    appId: document.getElementById('firebase-byok-app-id')?.value || '',
+  };
+}
+
+function hydrateFirebaseByokForm() {
+  if (requireFirebaseSetupOwner()) return;
+  const config = getFirebaseByokConfig();
+  if (!config) return;
+  const map = {
+    'firebase-byok-api-key': config.apiKey,
+    'firebase-byok-auth-domain': config.authDomain,
+    'firebase-byok-project-id': config.projectId,
+    'firebase-byok-storage': config.storageBucket,
+    'firebase-byok-sender': config.messagingSenderId,
+    'firebase-byok-app-id': config.appId,
+  };
+  Object.entries(map).forEach(([id, value]) => {
+    const el = document.getElementById(id);
+    if (el) el.value = value || '';
+  });
+}
+
+function setFirebaseByokStatus(message, type = 's') {
+  const el = document.getElementById('firebase-byok-status');
+  if (!el) return;
+  el.className = `text-xs mt-2 ${type === 'e' ? 'text-red-600' : type === 'w' ? 'text-amber-700' : 'text-emerald-600'}`;
+  el.textContent = message;
+}
+
+async function testFirebaseByokConfig() {
+  if (requireFirebaseSetupOwner()) return;
+  const config = readFirebaseByokForm();
+  const validation = validateFirebaseByokConfig(config);
+  if (!validation.valid) {
+    setFirebaseByokStatus(validation.message, 'e');
+    return;
+  }
+  setFirebaseByokStatus('Firebase config যাচাই হচ্ছে...', 'w');
+  let app;
+  try {
+    if (!firebase || !firebase.initializeApp) throw new Error('Firebase SDK লোড হয়নি।');
+    const name = 'mediworld-byok-test-' + Date.now();
+    app = firebase.initializeApp(validation.config, name);
+    await app.firestore().collection('branches').limit(1).get();
+    setFirebaseByokStatus('সংযোগ সফল: config বৈধ এবং Firestore reachable। এরপর Authorized domains ও rules পরীক্ষা করুন।', 's');
+  } catch (err) {
+    const message = String(err?.message || err);
+    if (/permission|denied|unauthenticated/i.test(message)) {
+      setFirebaseByokStatus('Project reachable, কিন্তু sign-in/Firestore rules অনুমতি মেলেনি। Authorized domains ও rules deploy করুন।', 'w');
+    } else {
+      setFirebaseByokStatus('Firebase সংযোগ ব্যর্থ: ' + message, 'e');
+    }
+  } finally {
+    if (app) firebase.app(app.name).delete().catch(() => {});
+  }
+}
+
+function saveFirebaseByokConfigForm() {
+  if (requireFirebaseSetupOwner()) return;
+  try {
+    saveFirebaseByokConfig(readFirebaseByokForm());
+    setFirebaseByokStatus('কনফিগ এই ডিভাইসে সেভ হয়েছে; Super Admin অনুমোদন ও active billing না হওয়া পর্যন্ত pending থাকবে।', 'w');
+  } catch (err) {
+    setFirebaseByokStatus(humanizeError(err), 'e');
+  }
+}
+
+function clearFirebaseByokConfigForm() {
+  if (requireFirebaseSetupOwner()) return;
+  clearFirebaseByokConfig();
+  setFirebaseByokStatus('এই ডিভাইসের Client Firebase config মুছে ফেলা হয়েছে।', 's');
 }
 
 // ────────────────────────────────────────────────────────────
@@ -171,7 +413,7 @@ function refreshPinLockCard() {
 }
 
 function openPinSetModal(isChange) {
-  if (guardReadOnly()) return;
+  if (guardOwnerOnly()) return;
   document.getElementById('pinset-modal')?.remove();
   const modal = document.createElement('div');
   modal.id = 'pinset-modal';
@@ -198,6 +440,7 @@ function openPinSetModal(isChange) {
 }
 
 async function savePinSet() {
+  if (guardOwnerOnly()) return;
   const errEl = document.getElementById('pinset-error');
   errEl.classList.add('hidden');
   const pin1 = document.getElementById('pinset-new').value.trim();
@@ -222,7 +465,7 @@ async function savePinSet() {
 }
 
 async function disablePinLock() {
-  if (guardReadOnly()) return;
+  if (guardOwnerOnly()) return;
   if (!confirm('PIN লক বন্ধ করবেন? এই ডিভাইসে আর PIN চাইবে না।')) return;
   try {
     const res = await apiSaveSettings({ pinLockEnabled: false });
@@ -262,7 +505,7 @@ async function refreshEmailPrefCard() {
 }
 
 async function toggleEmailUnsubscribe(currentlySubscribed) {
-  if (guardReadOnly()) return;
+  if (guardOwnerOnly()) return;
   const newUnsubscribedFlag = currentlySubscribed; // সাবস্ক্রাইবড থাকলে → নতুন স্টেট: unsubscribed = true
   const btn = document.getElementById('email-pref-toggle-btn');
   if (btn) { btn.disabled = true; btn.textContent = '...'; }
@@ -342,7 +585,7 @@ async function refreshCashBalanceCard() {
 }
 
 async function saveCashBalanceManual() {
-  if (guardReadOnly()) return;
+  if (guardOwnerOnly()) return;
   const input = document.getElementById('cash-balance-input');
   const amount = parseFloat(input.value);
   if (isNaN(amount) || amount < 0) { toast('সঠিক (০ বা তার বেশি) পরিমাণ দিন।', 'w'); return; }
@@ -366,7 +609,7 @@ async function saveCashBalanceManual() {
 }
 
 async function saveSettingsForm() {
-  if (guardReadOnly()) return; 
+  if (guardOwnerOnly()) return;
   const name = document.getElementById('set-name').value.trim();
   if (!name) { toast('ফার্মেসির নাম দিন।', 'w'); return; }
 
@@ -464,6 +707,7 @@ function renderLogoPreview() {
 }
 
 async function onLogoFileSelect(event) {
+  if (guardOwnerOnly()) { event.target.value = ''; return; }
   const errEl = document.getElementById('logo-error');
   errEl.classList.add('hidden');
 
@@ -491,7 +735,7 @@ async function onLogoFileSelect(event) {
 }
 
 async function removeLogo() {
-  if (guardReadOnly()) return;
+  if (guardOwnerOnly()) return;
   if (!confirm('লোগো মুছে ফেলতে চান?')) return;
   try {
     const res = await apiSaveSettings({ logoBase64: '' });
@@ -507,6 +751,7 @@ async function removeLogo() {
 // ✅ ধাপ ০.৩: এক্সপোর্ট-সফল হওয়ার পর Firestore-এ টাইমস্ট্যাম্প — fire-and-forget,
 // ব্যর্থ হলেও এক্সপোর্ট নিজে (ইতিমধ্যে সফল) আটকাবে না, শুধু রিমাইন্ডার সামান্য stale থাকবে
 async function recordExcelExportTimestamp() {
+  if (guardOwnerOnly()) return;
   APP_STATE.lastExportAt = new Date(); // ✅ optimistic — Settings/Dashboard-এ সাথে সাথে রিফ্লেক্ট
   try {
     await apiSaveSettings({ lastExportAt: firebase.firestore.FieldValue.serverTimestamp() });
@@ -528,6 +773,7 @@ function renderLastExportNote() {
 }
 
 async function exportGlobalJson() {
+  if (guardOwnerOnly()) return;
   if (!navigator.onLine) return toast('JSON Export-এর জন্য ইন্টারনেট সংযোগ দরকার।', 'w');
   const branchIds = APP_STATE.isOwner
     ? (APP_STATE.branches || []).map(b => b.id).filter(Boolean)
@@ -547,7 +793,7 @@ async function exportGlobalJson() {
     format: 'sohojtech-export',
     schemaVersion: 1,
     exportedAt: new Date().toISOString(),
-    app: 'সহজটেক / SohojTech',
+    app: APP_CONFIG.PLATFORM_NAME,
     scope: APP_STATE.isOwner ? 'owner-consolidated' : 'branch',
     branchMetadata: (APP_STATE.isOwner ? APP_STATE.branches : APP_STATE.branches.filter(b => b.id === APP_STATE.activeBranchId)).map(b => ({ id:b.id,name:b.name||'',active:b.active!==false })),
     collections
@@ -566,6 +812,7 @@ async function exportGlobalJson() {
 
 let globalImportPreview = null;
 async function previewGlobalImport() {
+  if (guardOwnerOnly()) return;
   if (!navigator.onLine) return toast('Import-এর জন্য ইন্টারনেট সংযোগ দরকার।', 'w');
   const file = document.getElementById('global-import-file')?.files?.[0];
   if (!file) return toast('Import JSON ফাইল নির্বাচন করুন।', 'w');
@@ -610,6 +857,7 @@ function validateGlobalExport(payload) {
 }
 
 async function applyGlobalImport() {
+  if (guardOwnerOnly()) return;
   if (!globalImportPreview) return;
   const payload = globalImportPreview;
   let imported = 0, skipped = 0, failed = 0;
@@ -646,6 +894,7 @@ async function applyGlobalImport() {
 }
 
 function exportToExcel() {
+  if (guardOwnerOnly()) return;
   const wb = XLSX.utils.book_new();
   const sheets = {
     'Medicines': APP_STATE.medicines,
@@ -672,6 +921,7 @@ function exportToExcel() {
 }
 
 function openResetConfirm() {
+  if (guardOwnerOnly()) return;
   const modal = document.createElement('div');
   modal.id = 'reset-modal';
   modal.className = 'fixed inset-0 z-[9995] bg-black/50 flex items-center justify-center p-4';
@@ -691,7 +941,7 @@ function openResetConfirm() {
 }
 
 async function confirmReset() {
-  if (guardReadOnly()) return;
+  if (guardOwnerOnly()) return;
   if (document.getElementById('reset-confirm-input').value.trim() !== 'RESET') {
     toast('ঠিক করে "RESET" লিখুন।', 'w'); return;
   }
