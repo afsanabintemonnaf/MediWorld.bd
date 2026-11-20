@@ -225,13 +225,63 @@ function renderFirebaseByokFields() {
   </div>`;
 }
 
+function getFirebaseConsoleProjectUrl(projectId, suffixPath = '') {
+  const cleanId = String(projectId || '').trim();
+  const safeSegment = cleanId ? encodeURIComponent(cleanId) : 'YOUR_PROJECT_ID';
+  const normalizedPath = suffixPath.startsWith('/') ? suffixPath : `/${suffixPath}`;
+  return `https://console.firebase.google.com/project/${safeSegment}${normalizedPath}`;
+}
+
+function syncFirebaseSetupGuideLinks(projectId) {
+  const inputEl = typeof document !== 'undefined' ? document.getElementById('firebase-byok-project-id') : null;
+  const effectiveId = projectId !== undefined
+    ? String(projectId || '').trim()
+    : (inputEl ? String(inputEl.value || '').trim() : '');
+
+  const links = typeof document !== 'undefined'
+    ? document.querySelectorAll('a[data-firebase-console-path]')
+    : [];
+
+  links.forEach((link) => {
+    const path = link.getAttribute('data-firebase-console-path') || '';
+    const url = getFirebaseConsoleProjectUrl(effectiveId, path);
+    link.setAttribute('href', url);
+    link.setAttribute('title', url);
+    link.textContent = url;
+  });
+}
+
 function renderFirebaseSetupGuide() {
-  return `<ol class="mt-4 space-y-2 text-xs text-slate-600 dark:text-slate-300 list-decimal pl-5">
-    <li>Firebase Console-এ নতুন Project তৈরি করুন; প্রজেক্টে Firestore Database তৈরি করুন।</li>
-    <li>Authentication → Sign-in method-এ Google চালু করুন। Settings → Authorized domains-এ <code>${esc(typeof location !== 'undefined' ? location.hostname : 'আপনার-app-domain')}</code> যোগ করুন। <button onclick="copyFirebaseAppDomain()" class="text-brand underline">App domain কপি</button></li>
-    <li>Project settings → Your apps → Web app থেকে <code>firebaseConfig</code> কপি করে উপরের ঘরগুলো পূরণ করুন। <button onclick="copyFirebaseConfig()" class="text-brand underline">কনফিগ কপি</button></li>
-    <li>Firestore → Rules-এ প্রজেক্টের <code>firestore.rules</code> প্রয়োগ ও Publish করুন। <button onclick="copyFirebaseRules()" class="text-brand underline">Rules কপি</button></li>
-    <li>Firestore → Indexes → Composite → Create index-এ collection <code>transfers</code> দিয়ে <code>sourceBranchId Ascending + createdAt Descending</code> এবং <code>targetBranchId Ascending + createdAt Descending</code> index তৈরি করুন। <button onclick="copyTransferIndexes()" class="text-brand underline">Index JSON কপি</button></li>
+  const initialProjectId = (typeof getFirebaseByokConfig === 'function' && getFirebaseByokConfig()?.projectId)
+    || 'mediworld-f6ab4';
+
+  const renderLinkLine = (label, path) => {
+    const url = getFirebaseConsoleProjectUrl(initialProjectId, path);
+    return `<div class="mt-1"><span class="text-slate-500 dark:text-slate-400">${esc(label)}:</span> <a href="${esc(url)}" data-firebase-console-path="${esc(path)}" target="_blank" rel="noopener noreferrer" class="text-brand underline break-all">${esc(url)}</a></div>`;
+  };
+
+  return `<ol class="mt-4 space-y-2.5 text-xs text-slate-600 dark:text-slate-300 list-decimal pl-5">
+    <li>
+      Firebase Console-এ নতুন Project তৈরি করুন; প্রজেক্টে Firestore Database তৈরি করুন। (উপরের <strong>Project ID</strong> ঘরে আপনার প্রজেক্ট আইডি লিখলে নিচের সব লিংক স্বয়ংক্রিয়ভাবে আপডেট হবে।)
+      ${renderLinkLine('Firestore Database লিংক', '/firestore')}
+    </li>
+    <li>
+      Authentication → Sign-in method-এ Google চালু করুন। Settings → Authorized domains-এ <code>${esc(typeof location !== 'undefined' ? location.hostname : 'আপনার-app-domain')}</code> যোগ করুন। <button onclick="copyFirebaseAppDomain()" class="text-brand underline">App domain কপি</button>
+      ${renderLinkLine('Sign-in method (Google) লিংক', '/authentication/providers')}
+      ${renderLinkLine('Authentication Settings লিংক', '/authentication/settings')}
+    </li>
+    <li>
+      Project settings → Your apps → Web app থেকে <code>firebaseConfig</code> কপি করে উপরের ঘরগুলো পূরণ করুন (অপশন চাইলে <strong>Use npm</strong> না নিয়ে <strong>Use a &lt;script&gt; tag</strong> নির্বাচন করুন)। <button onclick="copyFirebaseConfig()" class="text-brand underline">কনফিগ কপি</button>
+      ${renderLinkLine('Project settings লিংক', '/settings/general')}
+    </li>
+    <li>
+      Firestore → Rules-এ প্রজেক্টের <code>firestore.rules</code> প্রয়োগ ও Publish করুন। <button onclick="copyFirebaseRules()" class="text-brand underline">Rules কপি</button>
+      ${renderLinkLine('Firestore Rules লিংক', '/firestore/rules')}
+    </li>
+    <li>
+      Firestore → Indexes → Composite → Create index-এ collection <code>transfers</code> দিয়ে <code>sourceBranchId Ascending + createdAt Descending</code> এবং <code>targetBranchId Ascending + createdAt Descending</code> index তৈরি করুন। <button onclick="copyTransferIndexes()" class="text-brand underline">Index JSON কপি</button>
+      ${renderLinkLine('Firestore Indexes লিংক', '/firestore/indexes')}
+    </li>
     <li>সংযোগ টেস্ট সফল হলে সেভ করুন। কনফিগ এখন শুধু এই ডিভাইসে pending অবস্থায় থাকবে; Super Admin অনুমোদন, সেটআপ ফি ও সক্রিয় মাসিক মেয়াদ না হওয়া পর্যন্ত এটি কার্যকর হবে না।</li>
   </ol>`;
 }
@@ -326,8 +376,19 @@ function readFirebaseByokForm() {
 
 function hydrateFirebaseByokForm() {
   if (requireFirebaseSetupOwner()) return;
+  const projectInput = document.getElementById('firebase-byok-project-id');
+  if (projectInput && !projectInput.dataset.linkSyncBound) {
+    projectInput.dataset.linkSyncBound = '1';
+    projectInput.addEventListener('input', (e) => {
+      syncFirebaseSetupGuideLinks(e.target.value);
+    });
+  }
+
   const config = getFirebaseByokConfig();
-  if (!config) return;
+  if (!config) {
+    syncFirebaseSetupGuideLinks(projectInput ? projectInput.value : '');
+    return;
+  }
   const map = {
     'firebase-byok-api-key': config.apiKey,
     'firebase-byok-auth-domain': config.authDomain,
@@ -340,6 +401,7 @@ function hydrateFirebaseByokForm() {
     const el = document.getElementById(id);
     if (el) el.value = value || '';
   });
+  syncFirebaseSetupGuideLinks(config.projectId);
 }
 
 function setFirebaseByokStatus(message, type = 's') {
