@@ -36,6 +36,8 @@ function initAuthGate() {
     if (ownerUnsub) { ownerUnsub(); ownerUnsub = null; }
     if (staffUnsub) { staffUnsub(); staffUnsub = null; }
     mainAppBooted = false;
+    resolvingUid = null;
+    googleAuthInFlight = false;
 
     if (!user) {
       resolvingUid = null;
@@ -468,17 +470,24 @@ function isCoopOrPopupBlocked(err) {
   );
 }
 
+let googleAuthInFlight = false;
 function signInWithGoogle() {
+  if (googleAuthInFlight) return;
+  googleAuthInFlight = true;
   const provider = new firebase.auth.GoogleAuthProvider();
   provider.setCustomParameters({ prompt: "select_account" });
-  fbAuth.signInWithPopup(provider).catch((err) => {
-    if (isCoopOrPopupBlocked(err)) {
-      return fbAuth.signInWithRedirect(provider).catch((redirErr) => {
-        toast("লগইন ব্যর্থ: " + (redirErr && redirErr.message ? redirErr.message : ""), "e");
-      });
-    }
-    toast("লগইন ব্যর্থ: " + (err && err.message ? err.message : ""), "e");
-  });
+  fbAuth.signInWithPopup(provider)
+    .catch((err) => {
+      if (isCoopOrPopupBlocked(err)) {
+        return fbAuth.signInWithRedirect(provider).catch((redirErr) => {
+          toast("লগইন ব্যর্থ: " + (redirErr && redirErr.message ? redirErr.message : ""), "e");
+        });
+      }
+      toast("লগইন ব্যর্থ: " + (err && err.message ? err.message : ""), "e");
+    })
+    .finally(() => {
+      googleAuthInFlight = false;
+    });
 }
 function signOutUser() {
   const closeSession = APP_STATE.activeWorkSessionId
