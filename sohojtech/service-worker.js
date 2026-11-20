@@ -1,6 +1,6 @@
 'use strict';
 
-const CACHE_NAME = 'mediworld-bd-shell-v2';
+const CACHE_NAME = 'mediworld-bd-shell-v3';
 const CACHE_PREFIX = 'mediworld-bd-shell-';
 const NETWORK_TIMEOUT_MS = 3000;
 

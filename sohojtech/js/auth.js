@@ -67,7 +67,9 @@ async function resolveIdentity(user) {
   console.warn("[AuthTrace] resolveIdentity start", { uid: user.uid, email: user.email });
   const ownerRef = fbDb.collection('owners').doc(user.uid);
   try {
+    console.warn("[AuthStep] step1 owners.get start");
     const ownerSnap = await ownerRef.get();
+    console.warn("[AuthStep] step1 owners.get done", { exists: ownerSnap.exists });
     if (ownerSnap.exists) {
       const owner = ownerSnap.data();
       if (String(owner.uid || user.uid) === user.uid &&
@@ -85,10 +87,13 @@ async function resolveIdentity(user) {
 
     const normalizedEmail = String(user.email || '').trim().toLowerCase();
     const staffRef = fbDb.collection('staff').doc(user.uid);
+    console.warn("[AuthStep] step2 staff/{uid}.get start");
     let staffSnap = await staffRef.get();
+    console.warn("[AuthStep] step2 staff/{uid}.get done", { exists: staffSnap.exists });
     let matchedDocId = staffSnap.exists ? staffSnap.id : null;
 
     if (!staffSnap.exists && normalizedEmail) {
+      console.warn("[AuthStep] step3 staff.where(email) start", normalizedEmail);
       const byEmailSnap = await fbDb.collection('staff')
         .where('email', '==', normalizedEmail)
         .limit(1)
