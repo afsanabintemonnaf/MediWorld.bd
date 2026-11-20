@@ -12,6 +12,13 @@ function initAuthGate() {
   try {
     firebase.initializeApp(getEffectiveFirebaseConfig());
     fbAuth = firebase.auth();
+  if (typeof fbAuth.getRedirectResult === "function") {
+    fbAuth.getRedirectResult().catch((err) => {
+      if (err && err.code) {
+        toast("লগইন ব্যর্থ: " + (err.message || err.code), "e");
+      }
+    });
+  }
     fbDb = firebase.firestore();
     fbDb.settings({ ignoreUndefinedProperties: true });
     fbDb.enablePersistence({ synchronizeTabs: true }).catch((err) => {
@@ -422,14 +429,6 @@ function isCoopOrPopupBlocked(err) {
     msg.includes("cross-origin-opener-policy") ||
     msg.includes("window.closed")
   );
-}
-
-if (typeof fbAuth !== "undefined" && typeof fbAuth.getRedirectResult === "function") {
-  fbAuth.getRedirectResult().catch((err) => {
-    if (err && err.code) {
-      toast("লগইন ব্যর্থ: " + (err.message || err.code), "e");
-    }
-  });
 }
 
 function signInWithGoogle() {
