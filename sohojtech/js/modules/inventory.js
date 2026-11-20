@@ -1,0 +1,451 @@
+'use strict';
+
+// ════════════════════════════════════════════════════════════
+// INVENTORY MODULE — ব্যাচ-ভিত্তিক স্টক ভিউ (FEFO)
+// ════════════════════════════════════════════════════════════
+
+let invSearchDebounce = null;
+
+// ════════════════════════════════════════════════════════════
+// ✅ ধাপ ৭: স্টক মিউটেশন হেল্পার — এখন এখানে কেন্দ্রীভূত (আগে returns.js-এ
+// ছিল, কিন্তু আসলে এটাই এদের প্রকৃত জায়গা — inventory.js)।
+// এই তিনটা ফাংশন pos.js, purchase.js, returns.js, opening.js, settings.js
+// থেকে global scope-এ কল হয়।
+// ════════════════════════════════════════════════════════════
+
+function restockItem(medId, qty, cost, consumedBatches) {
+  const inv = APP_STATE.inventory.find(m => m.medId === medId);
+  if (!inv) return;
+  if (consumedBatches && consumedBatches.length) {
+    // ✅ ফিক্স: consumedBatches দেওয়া থাকলে (sale/return delete থেকে আসা) ঠিক
+    // সেই ব্যাচেই স্টক ফেরত — batches[0]-এ ঢালার বদলে, batch-level cost/expiry অক্ষুণ্ণ থাকে
+    consumedBatches.forEach(cb => {
+      const target = inv.batches.find(b => b.batchId === cb.batchId);
+      if (target) target.stock += cb.qty;
+      else inv.batches.push({
+        batchId: cb.batchId,
+        batchNumber: cb.batchNumber || cb.batchId,
+        expiry: cb.expiry || '',
+        stock: cb.qty,
+        cost: cb.cost || 0,
+        mrp: cb.mrp || 0,
+        sell: cb.sell || inv.sellPrice,
+        unitsPerStrip: cb.unitsPerStrip || 1,
+        stripsPerBox: cb.stripsPerBox || 1,
+      });
+    });
+  } else if (inv.batches.length) {
+    // ফলব্যাক: পুরনো (ফিক্সের আগের) রেকর্ড — আগের আচরণ অপরিবর্তিত
+    inv.batches[0].stock += qty;
+  } else {
+    inv.batches.push({ batchId: 'BAT-RET-' + Date.now(), expiry: '', stock: qty, cost: cost || 0, mrp: 0, sell: inv.sellPrice });
+  }
+  recalcInventoryRow(inv);
+}
+
+// ✅ নতুন: consumedBatches-ভিত্তিক precise destock — কাস্টমার-রিটার্ন এন্ট্রি
+// মুছে ফেলার সময় ঠিক যে ব্যাচে return-এর সময় স্টক ফেরত দেওয়া হয়েছিল, সেখান
+// থেকেই নির্ভুলভাবে বাদ দেওয়ার জন্য। consumedBatches না থাকলে (পুরনো রেকর্ড)
+// সাধারণ FEFO destockItem()-এ ফলব্যাক করে।
+function destockFromConsumed(medId, qty, consumedBatches) {
+  const inv = APP_STATE.inventory.find(m => m.medId === medId);
+  if (!inv) return;
+  if (consumedBatches && consumedBatches.length) {
+    consumedBatches.forEach(cb => {
+      const target = inv.batches.find(b => b.batchId === cb.batchId);
+      if (target) target.stock = Math.max(0, target.stock - cb.qty);
+    });
+    inv.batches = inv.batches.filter(b => b.stock > 0);
+    recalcInventoryRow(inv);
+  } else {
+    destockItem(medId, qty);
+  }
+}
+
+// ✅ ধাপ ২৬: precise batch-level destock — supplier return-এ ব্যবহৃত।
+// destockItem()-এর FEFO/furthest heuristic থেকে ভিন্ন — নির্দিষ্ট batchId
+// থেকেই কাটে, অন্য কোনো ব্যাচ স্পর্শ করে না। ব্যাচ না পেলে বা স্টক
+// অপর্যাপ্ত হলে স্পষ্ট ব্যর্থতা রিটার্ন করে (silently fallback করে না —
+// patient-safety/compliance ঝুঁকি এড়াতে)।
+function destockByBatchId(medId, batchId, qty) {
+  const inv = APP_STATE.inventory.find(m => m.medId === medId);
+  if (!inv) return { success: false, message: 'ওষুধ ইনভেন্টরিতে পাওয়া যায়নি।' };
+  const batch = inv.batches.find(b => b.batchId === batchId);
+  if (!batch) return { success: false, message: `ব্যাচ (${batchId}) পাওয়া যায়নি — সম্ভবত সম্পূর্ণ বিক্রি হয়ে গেছে।` };
+  if (batch.stock < qty) return { success: false, message: `এই ব্যাচে মাত্র ${batch.stock} ইউনিট আছে — নির্দিষ্ট ব্যাচ থেকে এত রিটার্ন সম্ভব না।` };
+  batch.stock -= qty;
+  inv.batches = inv.batches.filter(b => b.stock > 0);
+  recalcInventoryRow(inv);
+  return { success: true };
+}
+
+function destockItem(medId, qty) {
+  const inv = APP_STATE.inventory.find(m => m.medId === medId);
+  if (!inv) return;
+  let remaining = qty;
+  inv.batches.sort((a, b) => compareBatchExpiry(a, b, 'asc'));
+  for (const b of inv.batches) { if (remaining <= 0) break; const take = Math.min(b.stock, remaining); b.stock -= take; remaining -= take; }
+  inv.batches = inv.batches.filter(b => b.stock > 0);
+  recalcInventoryRow(inv);
+}
+function recalcInventoryRow(inv) {
+  inv.totalStock = inv.batches.reduce((a, b) => a + b.stock, 0);
+  inv.costValue = round2(inv.batches.reduce((a, b) => a + b.cost * b.stock, 0));
+  inv.mrpValue = round2(inv.batches.reduce((a, b) => a + b.mrp * b.stock, 0));
+  inv.batches.sort((a, b) => compareBatchExpiry(a, b, 'asc')); // ✅ ধাপ ৩১ ফিক্স
+  inv.nearestExpiry = inv.batches[0]?.expiry || '';
+  const med = APP_STATE.medicines.find(m => m.id === inv.medId);
+  const reorderLevel = getEffectiveReorderLevel(med);
+  inv.status = inv.totalStock === 0 ? 'out' : inv.totalStock <= reorderLevel ? 'low' : 'ok';
+}
+
+function renderInventoryModule() {
+  const c = document.getElementById('inventory-content');
+  if (!c) return;
+  APP_STATE.invSearch = APP_STATE.invSearch || '';
+  APP_STATE.invExpanded = APP_STATE.invExpanded || null;
+  APP_STATE.invGroupByManufacturer = APP_STATE.invGroupByManufacturer !== false;
+
+  const inv = APP_STATE.inventory;
+  const totalCost = inv.reduce((a, b) => a + (b.costValue || 0), 0);
+  const totalMrp = inv.reduce((a, b) => a + (b.mrpValue || 0), 0);
+  const lowCount = inv.filter(m => {
+    if (!hasMedicinePurchaseHistory(m.medId)) return false;
+    const med = APP_STATE.medicines.find(x => x.id === m.medId);
+    return Number(m.totalStock || 0) > 0 && Number(m.totalStock || 0) <= getEffectiveReorderLevel(med);
+  }).length;
+  const outCount = inv.filter(m => {
+    if (!hasMedicinePurchaseHistory(m.medId)) return false;
+    return Number(m.totalStock || 0) === 0;
+  }).length;
+
+  c.innerHTML = `
+    <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-5">
+      ${statCard('মোট ওষুধ', inv.length + ' টি', 'fa-pills', 'blue')}
+      ${statCard('স্বল্প স্টক', lowCount + ' টি', 'fa-box-open', 'orange')}
+      ${statCard('স্টকশূন্য', outCount + ' টি', 'fa-ban', 'red')}
+      ${statCard('মোট MRP মূল্য', '৳' + fmtK(totalMrp), 'fa-money-bill-trend-up', 'green')}
+    </div>
+
+    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden">
+      <div class="inventory-toolbar px-5 py-3 border-b border-slate-200 dark:border-slate-700 flex justify-between items-center gap-3">
+        <h5 class="text-sm font-semibold text-slate-700 dark:text-slate-200"><i class="fa-solid fa-table-list text-brand mr-1"></i> স্টক সারসংক্ষেপ</h5>
+        <div class="inventory-toolbar-actions">
+          <div class="inventory-toggle-group" role="group" aria-label="ইনভেন্টরি ভিউ">
+            <button type="button" onclick="setInventoryView('card')" aria-pressed="${APP_STATE.invView === 'card'}" class="inventory-toggle ${APP_STATE.invView === 'card' ? 'is-active' : ''}"><i class="fa-solid fa-grip"></i> কার্ড</button>
+            <button type="button" onclick="setInventoryView('line')" aria-pressed="${APP_STATE.invView === 'line'}" class="inventory-toggle ${APP_STATE.invView === 'line' ? 'is-active' : ''}"><i class="fa-solid fa-list"></i> লাইন</button>
+          </div>
+          <button type="button" onclick="toggleInvManufacturerGrouping()" aria-pressed="${APP_STATE.invGroupByManufacturer}" class="inventory-toggle ${APP_STATE.invGroupByManufacturer ? 'is-active' : ''}"><i class="fa-solid fa-industry"></i> ম্যানুফ্যাকচারার গ্রুপ</button>
+          <button onclick="openReorderQuickListModal()" class="btn btn-secondary btn-sm"><i class="fa-solid fa-building mr-1"></i>কোম্পানি/প্রতিনিধি রিপোর্ট</button>
+          <input type="text" id="inv-search" placeholder="ওষুধ বা ম্যানুফ্যাকচারার খুঁজুন..." value="${esc(APP_STATE.invSearch)}"
+            oninput="onInvSearch(this.value)"
+            class="w-40 sm:w-56 px-3 py-1.5 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+      </div>
+      <div id="inv-table-body"></div>
+    </div>
+  `;
+  renderInvTable();
+}
+
+function onInvSearch(val) {
+  APP_STATE.invSearch = val;
+  clearTimeout(invSearchDebounce);
+  invSearchDebounce = setTimeout(renderInvTable, 150);
+}
+
+function toggleInvBatches(medId) {
+  APP_STATE.invExpanded = APP_STATE.invExpanded === medId ? null : medId;
+  renderInvTable();
+}
+
+function setInventoryView(view) {
+  APP_STATE.invView = view;
+  renderInventoryModule();
+}
+
+function toggleInvManufacturerGrouping() {
+  APP_STATE.invGroupByManufacturer = !APP_STATE.invGroupByManufacturer;
+  renderInventoryModule();
+}
+
+function renderInvTable() {
+  const body = document.getElementById('inv-table-body');
+  if (!body) return;
+  const medicinesById = new Map(APP_STATE.medicines.map(m => [m.id, m]));
+  const q = (APP_STATE.invSearch || '').toLowerCase();
+  const collator = new Intl.Collator('bn', { sensitivity: 'base', numeric: true });
+  const list = APP_STATE.inventory.filter(m => {
+    const med = medicinesById.get(m.medId);
+    return !q || [m.brand, m.doseForm, m.strength, med?.manufacturer]
+      .filter(Boolean).join(' ').toLowerCase().includes(q);
+  }).sort((a, b) => collator.compare(a.brand || '', b.brand || ''));
+
+  if (!list.length) {
+    body.innerHTML = `<div class="px-5 py-10 text-center text-slate-400 text-sm"><i class="fa-solid fa-boxes-stacked text-2xl opacity-30 mb-2 block"></i>কোনো স্টক পাওয়া যায়নি</div>`;
+    return;
+  }
+
+  const groupedItems = APP_STATE.invGroupByManufacturer
+    ? Array.from(list.reduce((groups, item) => {
+      const manufacturer = medicinesById.get(item.medId)?.manufacturer?.trim() || 'ম্যানুফ্যাকচারার উল্লেখ নেই';
+      if (!groups.has(manufacturer)) groups.set(manufacturer, []);
+      groups.get(manufacturer).push(item);
+      return groups;
+    }, new Map()).entries())
+      .sort(([a], [b]) => {
+        if (a === 'ম্যানুফ্যাকচারার উল্লেখ নেই') return 1;
+        if (b === 'ম্যানুফ্যাকচারার উল্লেখ নেই') return -1;
+        return collator.compare(a, b);
+      })
+      .map(([manufacturer, items]) => ({ manufacturer, items }))
+    : [{ manufacturer: '', items: list }];
+  const hasGroups = APP_STATE.invGroupByManufacturer;
+
+  body.className = `inventory-results ${APP_STATE.invView === 'card' ? 'inv-view-card' : APP_STATE.invView === 'line' ? 'inv-view-line' : ''}`;
+  body.innerHTML = `
+    <div class="inventory-mobile-list">
+      ${groupedItems.map(group => `
+        <section class="inventory-mobile-group">
+          ${hasGroups ? `<h6 class="inventory-group-heading"><i class="fa-solid fa-industry mr-1"></i>${esc(group.manufacturer)}<span>${group.items.length}</span></h6>` : ''}
+          ${group.items.map(m => renderInvMobileCard(m, medicinesById.get(m.medId))).join('')}
+        </section>`).join('')}
+    </div>
+    <div class="inventory-table-scroll overflow-x-auto">
+    <table class="inventory-table w-full text-sm">
+      <thead class="bg-slate-50 dark:bg-slate-900/40 text-[11px] uppercase text-slate-500 dark:text-slate-400">
+        <tr>
+          <th class="px-4 py-2.5 text-left">ব্র্যান্ড</th>
+          <th class="px-4 py-2.5 text-left">ম্যানুফ্যাকচারার</th>
+          <th class="px-4 py-2.5 text-left hidden sm:table-cell">ফর্ম/শক্তি</th>
+          <th class="px-4 py-2.5 text-right">মোট স্টক</th>
+          <th class="px-4 py-2.5 text-left hidden md:table-cell">নিকটতম মেয়াদ</th>
+          <th class="px-4 py-2.5 text-right hidden md:table-cell">Cost মূল্য</th>
+          <th class="px-4 py-2.5 text-right hidden lg:table-cell">MRP মূল্য</th>
+          <th class="px-4 py-2.5 text-center">অবস্থা</th>
+          <th class="px-4 py-2.5 text-center">ব্যাচ</th>
+        </tr>
+      </thead>
+      <tbody>
+          ${groupedItems.map(group => `
+            ${hasGroups ? `<tr class="inventory-group-row"><th colspan="9"><div class="inventory-group-row-content"><span><i class="fa-solid fa-industry mr-1"></i>${esc(group.manufacturer)}</span><span>${group.items.length}</span></div></th></tr>` : ''}
+            ${group.items.map(m => renderInvRow(m, medicinesById.get(m.medId))).join('')}
+          `).join('')}
+      </tbody>
+    </table>
+    </div>`;
+}
+
+function renderInvMobileCard(m, med) {
+    const purchased = hasMedicinePurchaseHistory(m.medId);
+    const stockStatus = purchased
+      ? (Number(m.totalStock || 0) === 0 ? 'out' : Number(m.totalStock || 0) <= getEffectiveReorderLevel(med) ? 'low' : 'ok')
+      : 'ok';
+    const badge = stockStatus === 'out' ? `<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400">স্টকশূন্য</span>`
+      : stockStatus === 'low' ? `<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400">স্বল্প স্টক</span>`
+      : `<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400">স্বাভাবিক</span>`;
+    const isExpanded = APP_STATE.invExpanded === m.medId;
+    const batches = (m.batches || []).map(b => `
+      <div class="inventory-mobile-batch">
+        <div class="flex items-center justify-between gap-2">
+          <span class="font-mono text-xs font-semibold">${esc(b.batchId)}</span>
+          <span class="text-xs text-slate-500">${esc(b.expiry || 'মেয়াদ নেই')}</span>
+        </div>
+        <div class="grid grid-cols-2 gap-x-3 gap-y-1 mt-2 text-[11px] text-slate-500">
+          <span>স্টক: <b class="text-slate-700 dark:text-slate-200">${formatUnitQuantity(b.stock)}</b></span>
+          <span>ক্রয়মূল্য: <b class="text-slate-700 dark:text-slate-200">৳${fmt(b.cost)}</b></span>
+          <span>MRP: ৳${fmt(b.mrp)}</span>
+          <span>বিক্রয়মূল্য: ৳${fmt(b.sell)}</span>
+        </div>
+        <button onclick="openBatchEdit('${m.medId}','${b.batchId}')" class="mt-2 text-brand text-xs">
+          <i class="fa-solid fa-pen mr-1"></i>এডিট
+        </button>
+      </div>`).join('');
+
+    return `
+      <article class="inventory-mobile-card">
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0">
+            <h6 class="font-semibold text-slate-800 dark:text-white break-words">${esc(m.brand)}</h6>
+            <p class="mt-0.5 text-xs text-slate-500">${esc(m.doseForm || '—')} ${esc(m.strength || '')}</p>
+            <p class="mt-0.5 text-[11px] text-slate-400">${esc(med?.manufacturer || 'ম্যানুফ্যাকচারার উল্লেখ নেই')}</p>
+          </div>
+          ${badge}
+        </div>
+        <div class="inventory-mobile-summary">
+          <div><span>মোট স্টক</span><strong>${formatUnitQuantity(m.totalStock)}</strong></div>
+          <div><span>নিকটতম মেয়াদ</span><strong>${esc(m.nearestExpiry || '—')}</strong></div>
+          <div><span>Cost মূল্য</span><strong>৳${fmt(m.costValue || 0)}</strong></div>
+        </div>
+        <button type="button" onclick="toggleInvBatches('${m.medId}')" aria-expanded="${isExpanded}" class="inventory-mobile-batch-toggle">
+          <span><i class="fa-solid fa-layer-group mr-1"></i>${(m.batches || []).length}টি ব্যাচ</span>
+          <i class="fa-solid fa-chevron-${isExpanded ? 'up' : 'down'}"></i>
+        </button>
+        ${isExpanded ? `<div class="inventory-mobile-batches">${batches || '<p class="py-2 text-center text-xs text-slate-400">কোনো ব্যাচ নেই</p>'}</div>` : ''}
+      </article>`;
+}
+
+function renderInvRow(m, med) {
+  const purchased = hasMedicinePurchaseHistory(m.medId);
+  const stockStatus = purchased
+    ? (Number(m.totalStock || 0) === 0 ? 'out' : Number(m.totalStock || 0) <= getEffectiveReorderLevel(med) ? 'low' : 'ok')
+    : 'ok';
+  const badge = stockStatus === 'out' ? `<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-400">শূন্য</span>`
+    : stockStatus === 'low' ? `<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400">স্বল্প</span>`
+    : `<span class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400">স্বাভাবিক</span>`;
+
+  const isExpanded = APP_STATE.invExpanded === m.medId;
+  const batchRows = (m.batches || []).map(b => {
+    const daysLeft = b.expiry ? Math.ceil((parseExpiryDate(b.expiry) - new Date()) / 86400000) : null;
+    const expColor = daysLeft !== null && daysLeft <= 30 ? 'text-red-600' : daysLeft !== null && daysLeft <= 90 ? 'text-amber-600' : 'text-slate-500';
+    return `<tr class="text-xs border-t border-slate-100 dark:border-slate-700/50">
+      <td class="px-4 py-2 pl-8 font-mono text-slate-400">${esc(b.batchId)}</td>
+      <td class="px-4 py-2 ${expColor} font-semibold">${esc(b.expiry || '—')}</td>
+      <td class="px-4 py-2 text-right font-mono" title="${b.stock} ইউনিট">${formatUnitQuantity(b.stock)}</td>
+      <td class="px-4 py-2 text-right font-mono text-slate-500">৳${fmt(b.cost)}</td>
+      <td class="px-4 py-2 text-right font-mono text-slate-500">৳${fmt(b.mrp)}</td>
+      <td class="px-4 py-2 text-right font-mono text-brand">৳${fmt(b.sell)}</td>
+      <td class="px-4 py-2 text-right">
+        <button onclick="openBatchEdit('${m.medId}','${b.batchId}')" class="text-brand hover:underline text-[11px]"><i class="fa-solid fa-pen mr-1"></i>এডিট</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  return `
+    <tr class="border-t border-slate-100 dark:border-slate-700/50 hover:bg-slate-50 dark:hover:bg-slate-700/30">
+      <td class="px-4 py-3 font-semibold text-slate-800 dark:text-white">${esc(m.brand)}</td>
+      <td class="px-4 py-3 text-xs text-slate-500">${esc(med?.manufacturer || '—')}</td>
+      <td class="px-4 py-3 hidden sm:table-cell text-slate-500 text-xs">${esc(m.doseForm || '—')} ${esc(m.strength || '')}</td>
+      <td class="px-4 py-3 text-right font-mono font-bold ${stockStatus === 'out' ? 'text-red-600' : stockStatus === 'low' ? 'text-amber-600' : 'text-slate-700 dark:text-slate-200'}" title="${m.totalStock} ইউনিট">${formatUnitQuantity(m.totalStock)}</td>
+      <td class="px-4 py-3 hidden md:table-cell text-xs text-slate-500">${esc(m.nearestExpiry || '—')}</td>
+      <td class="px-4 py-3 hidden md:table-cell text-right font-mono text-xs text-slate-500">৳${fmt(m.costValue || 0)}</td>
+      <td class="px-4 py-3 hidden lg:table-cell text-right font-mono text-xs text-slate-500">৳${fmt(m.mrpValue || 0)}</td>
+      <td class="px-4 py-3 text-center">${badge}</td>
+      <td class="px-4 py-3 text-center">
+        <button onclick="toggleInvBatches('${m.medId}')" class="text-slate-400 hover:text-brand">
+          <i class="fa-solid fa-chevron-${isExpanded ? 'up' : 'down'}"></i> <span class="text-[11px]">${(m.batches || []).length}</span>
+        </button>
+      </td>
+    </tr>
+    ${isExpanded ? `
+    <tr class="bg-slate-50 dark:bg-slate-900/20">
+      <td colspan="9" class="p-0">
+        <table class="inventory-batch-table w-full">
+          <thead><tr class="text-[10px] uppercase text-slate-400">
+            <th class="px-4 pt-2 pb-1 text-left pl-8">Batch ID</th>
+            <th class="px-4 pt-2 pb-1 text-left">মেয়াদ</th>
+            <th class="px-4 pt-2 pb-1 text-right">স্টক</th>
+            <th class="px-4 pt-2 pb-1 text-right">ক্রয়মূল্য</th>
+            <th class="px-4 pt-2 pb-1 text-right">MRP</th>
+            <th class="px-4 pt-2 pb-1 text-right">বিক্রয়মূল্য</th>
+            <th class="px-4 pt-2 pb-1 text-right"></th>
+          </tr></thead>
+          <tbody>${batchRows || `<tr><td colspan="7" class="px-4 py-3 text-center text-xs text-slate-400">কোনো ব্যাচ নেই</td></tr>`}</tbody>
+        </table>
+      </td>
+    </tr>` : ''}
+  `;
+}
+
+// ────────────────────────────────────────────────────────────
+// BATCH EDIT MODAL (হালকা inline modal — sell price/stock সংশোধনের জন্য)
+// ────────────────────────────────────────────────────────────
+function openBatchEdit(medId, batchId) {
+  const inv = APP_STATE.inventory.find(m => m.medId === medId);
+  const batch = inv?.batches.find(b => b.batchId === batchId);
+  if (!batch) return;
+
+  const modal = document.createElement('div');
+  modal.id = 'batch-edit-modal';
+  modal.className = 'fixed inset-0 z-[9995] bg-black/50 flex items-center justify-center p-4';
+  modal.innerHTML = `
+    <div class="bg-white dark:bg-slate-800 rounded-xl p-6 max-w-md w-full max-h-[90vh] overflow-y-auto">
+     <h4 class="font-bold text-slate-800 dark:text-white mb-1">ব্যাচ এডিট — ${esc(inv.brand)}</h4>
+      <p class="text-xs text-slate-400 mb-4 font-mono">${esc(batchId)}</p>
+      <div class="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400 text-xs rounded-lg px-3 py-2 mb-4">
+        <i class="fa-solid fa-triangle-exclamation mr-1"></i> স্টক সংশোধন সাবধানে করুন — এটা সরাসরি ইনভেন্টরি পরিবর্তন করবে।
+      </div>
+      <div id="be-error" class="hidden bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 text-xs rounded-lg px-3 py-2 mb-4"></div>
+      <div class="grid grid-cols-2 gap-3 mb-4">
+        <div><label class="block text-xs font-semibold text-slate-500 uppercase mb-1">বর্তমান স্টক</label>
+          <input type="number" id="be-stock" value="${batch.stock}" min="0" class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/></div>
+        <div><label class="block text-xs font-semibold text-slate-500 uppercase mb-1">মেয়াদ</label>
+          <input type="text" id="be-expiry" value="${esc(batch.expiry)}" placeholder="MM/YYYY" class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/></div>
+        <div><label class="block text-xs font-semibold text-slate-500 uppercase mb-1">ক্রয়মূল্য</label>
+          <input type="number" id="be-cost" value="${batch.cost}" min="0" step="0.01" class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/></div>
+        <div><label class="block text-xs font-semibold text-slate-500 uppercase mb-1">MRP</label>
+          <input type="number" id="be-mrp" value="${batch.mrp}" min="0" step="0.01" class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/></div>
+        <div class="col-span-2"><label class="block text-xs font-semibold text-slate-500 uppercase mb-1">বিক্রয়মূল্য</label>
+          <input type="number" id="be-sell" value="${batch.sell}" min="0" step="0.01" class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/></div>
+      </div>
+      <div class="flex gap-2">
+        <button id="be-save-btn" onclick="saveBatchEdit('${medId}','${batchId}')" class="btn btn-primary flex-1">সংরক্ষণ করুন</button>
+        <button onclick="closeBatchEdit()" class="btn btn-secondary">বাতিল</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  openAppModal('batch-edit-modal', closeBatchEdit);
+}
+
+function closeBatchEdit() {
+  document.getElementById('batch-edit-modal')?.remove();
+}
+
+async function saveBatchEdit(medId, batchId) {
+  if (guardReadOnly()) return;
+  const inv = APP_STATE.inventory.find(m => m.medId === medId);
+  const batch = inv?.batches.find(b => b.batchId === batchId);
+  if (!batch) return;
+
+  const errEl = document.getElementById('be-error');
+  errEl.classList.add('hidden');
+
+  const fields = {
+    stock: parseInt(document.getElementById('be-stock').value) || 0,
+    expiry: document.getElementById('be-expiry').value || '',
+    cost: parseFloat(document.getElementById('be-cost').value) || 0,
+    mrp: parseFloat(document.getElementById('be-mrp').value) || 0,
+    sell: parseFloat(document.getElementById('be-sell').value) || 0,
+  };
+
+  const btn = document.getElementById('be-save-btn');
+  btn.disabled = true;
+  btn.textContent = 'সংরক্ষণ হচ্ছে...';
+
+  try {
+    const res = await apiUpdateBatch(medId, batchId, fields);
+    if (!res.success) {
+      errEl.textContent = res.message;
+      errEl.classList.remove('hidden');
+      btn.disabled = false;
+      btn.textContent = 'সংরক্ষণ করুন';
+      return;
+    }
+
+    // ✅ Firestore write সফল হলেই local APP_STATE বদলানো হচ্ছে
+    Object.assign(batch, fields);
+    inv.batches = inv.batches.filter(b => b.stock > 0);
+    recalcInventoryRow(inv);
+    if (fields.sell > 0) inv.sellPrice = fields.sell;
+
+    toast('ব্যাচ আপডেট হয়েছে।', 's');
+    closeBatchEdit();
+    renderInvTable();
+  } catch (err) {
+    showFatalError('ব্যাচ সংরক্ষণে সমস্যা:\n' + err.message);
+    btn.disabled = false;
+    btn.textContent = 'সংরক্ষণ করুন';
+  }
+}
+
+function statCard(label, val, icon, color) {
+  const colors = {
+    blue: 'text-brand bg-brand/10', green: 'text-emerald-600 bg-emerald-50 dark:bg-emerald-900/20',
+    red: 'text-red-600 bg-red-50 dark:bg-red-900/20', orange: 'text-amber-600 bg-amber-50 dark:bg-amber-900/20',
+  };
+  return `<div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-4">
+    <div class="w-9 h-9 rounded-lg ${colors[color]} flex items-center justify-center mb-2"><i class="fa-solid ${icon} text-sm"></i></div>
+    <div class="text-lg font-extrabold font-mono text-slate-800 dark:text-white">${esc(val)}</div>
+    <div class="text-xs text-slate-500">${esc(label)}</div>
+  </div>`;
+}

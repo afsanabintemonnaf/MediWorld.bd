@@ -1,0 +1,384 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/owners/$(request.auth.uid))
+        && get(/databases/$(database)/documents/owners/$(request.auth.uid)).data.uid == request.auth.uid
+        && get(/databases/$(database)/documents/owners/$(request.auth.uid)).data.role == 'owner'
+        && get(/databases/$(database)/documents/owners/$(request.auth.uid)).data.email.lower() == request.auth.token.email.lower();
+    }
+
+    function staffDoc() {
+      return get(/databases/$(database)/documents/staff/$(request.auth.uid)).data;
+    }
+
+    function isActiveStaff() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/staff/$(request.auth.uid))
+        && staffDoc().active == true
+        && staffDoc().status == 'active'
+        && staffDoc().email.lower() == request.auth.token.email.lower()
+        && staffDoc().ownerUid is string
+        && exists(/databases/$(database)/documents/owners/$(staffDoc().ownerUid))
+        && staffDoc().assignedBranchIds is list
+        && staffDoc().assignedBranchIds.size() > 0;
+    }
+
+    function ownsBranch(branchId) {
+      return isOwner()
+        && exists(/databases/$(database)/documents/branches/$(branchId))
+        && get(/databases/$(database)/documents/branches/$(branchId)).data.ownerUid == request.auth.uid;
+    }
+
+    function hasBranch(branchId) {
+      return isActiveStaff()
+        && branchId in staffDoc().assignedBranchIds
+        && exists(/databases/$(database)/documents/branches/$(branchId))
+        && get(/databases/$(database)/documents/branches/$(branchId)).data.ownerUid == staffDoc().ownerUid
+        && get(/databases/$(database)/documents/branches/$(branchId)).data.active == true;
+    }
+
+    function canAccessBranch(branchId) {
+      return ownsBranch(branchId) || hasBranch(branchId);
+    }
+
+    function hasPermission(permission) {
+      return isActiveStaff()
+        && staffDoc().permissions is map
+        && permission in staffDoc().permissions
+        && staffDoc().permissions[permission] == true;
+    }
+
+    function isManager() {
+      return isActiveStaff() && staffDoc().role == 'manager';
+    }
+
+    function hasFinancialPermission() {
+      return hasPermission('accounts') || hasPermission('pos')
+        || hasPermission('purchase') || hasPermission('returns')
+        || hasPermission('opening') || hasPermission('customers')
+        || hasPermission('suppliers');
+    }
+
+    function collectionPermission(collectionId) {
+      return (collectionId == 'sales' && hasPermission('pos'))
+        || (collectionId == 'returns' && hasPermission('returns'))
+        || (collectionId == 'customers' && (hasPermission('customers')
+          || hasPermission('pos') || hasPermission('returns') || hasPermission('opening')))
+        || (collectionId == 'purchases' && hasPermission('purchase'))
+        || (collectionId == 'suppliers' && (hasPermission('suppliers')
+          || hasPermission('purchase') || hasPermission('returns') || hasPermission('opening')))
+        || (collectionId == 'supplierPayments' && (hasPermission('suppliers') || hasPermission('accounts')))
+        || (collectionId == 'payments' && (hasPermission('customers') || hasPermission('pos') || hasPermission('accounts')))
+        || (collectionId == 'inventory' && (hasPermission('inventory') || hasPermission('pos')
+          || hasPermission('purchase') || hasPermission('returns') || hasPermission('opening')
+          || hasPermission('transfer') || hasPermission('stockTransfer') || hasPermission('maintenance')))
+        || (collectionId == 'medicines' && hasPermission('medicine'))
+        || (collectionId == 'openingEntries' && hasPermission('opening'))
+        || (collectionId in ['expenses', 'incomes'] && hasPermission('accounts'))
+        || (collectionId == 'shortList' && (hasPermission('inventory') || hasPermission('pos')))
+        || (collectionId == 'dailyReport' && hasPermission('dailyReport'))
+        || (collectionId == 'transfers' && (hasPermission('transfer') || hasPermission('stockTransfer')));
+    }
+
+    function canCreateBranchCollection(collectionId) {
+      return (collectionId == 'customers' && hasPermission('customers'))
+        || (collectionId == 'suppliers' && hasPermission('suppliers'))
+        || (collectionId != 'customers' && collectionId != 'suppliers'
+          && collectionPermission(collectionId));
+    }
+
+    function canUpdateBranchCollection(collectionId) {
+      return (collectionId == 'customers'
+          && (hasPermission('customers')
+            || ((hasPermission('pos') || hasPermission('returns') || hasPermission('opening'))
+              && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['due', 'totalPaid']))))
+        || (collectionId == 'suppliers'
+          && (hasPermission('suppliers')
+            || ((hasPermission('purchase') || hasPermission('returns') || hasPermission('opening'))
+              && request.resource.data.diff(resource.data).affectedKeys()
+                .hasOnly(['totalPayable', 'totalPaid']))))
+        || (collectionId != 'customers' && collectionId != 'suppliers'
+          && collectionPermission(collectionId));
+    }
+
+    function canReadBranchCollection(branchId, collectionId, documentId) {
+      return canAccessBranch(branchId)
+        && (ownsBranch(branchId)
+          || (!(collectionId in ['notifications', 'staffSalarySetups', 'salaryPayments',
+              'ownerAccounts', 'financialLedger'])
+            && (collectionId != 'config'
+              || (documentId == 'balances' && hasFinancialPermission()))));
+    }
+
+    function canWriteBalance(branchId, documentId) {
+      return documentId == 'balances'
+        && hasBranch(branchId)
+        && hasFinancialPermission()
+        && request.resource.data.keys().hasOnly(['cashBalance', 'lastUpdated'])
+        && request.resource.data.cashBalance is number
+        && request.resource.data.cashBalance >= -1000000000000000
+        && request.resource.data.cashBalance <= 1000000000000000
+        && request.resource.data.lastUpdated == request.time;
+    }
+
+    function validEmptyInventory(branchId, documentId) {
+      return request.resource.data.keys().hasOnly([
+          'medId', 'branchId', 'brand', 'doseForm', 'strength', 'totalStock',
+          'costValue', 'mrpValue', 'sellPrice', 'nearestExpiry', 'status', 'batches'
+        ])
+        && request.resource.data.medId == documentId
+        && (!('branchId' in request.resource.data) || request.resource.data.branchId == branchId)
+        && request.resource.data.totalStock == 0
+        && request.resource.data.costValue == 0
+        && request.resource.data.mrpValue == 0
+        && request.resource.data.sellPrice == 0
+        && request.resource.data.nearestExpiry == ''
+        && request.resource.data.status == 'out'
+        && request.resource.data.batches is list
+        && request.resource.data.batches.size() == 0;
+    }
+
+    function validTransferLedger(branchId, documentId) {
+      return hasBranch(branchId)
+        && (hasPermission('transfer') || hasPermission('stockTransfer'))
+        && request.resource.data.transferId == documentId
+        && request.resource.data.branchId == branchId
+        && request.resource.data.counterBranchId is string
+        && request.resource.data.direction in ['in', 'out']
+        && request.resource.data.amount is number
+        && request.resource.data.amount > 0
+        && request.resource.data.createdByUid == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && existsAfter(/databases/$(database)/documents/transfers/$(documentId))
+        && getAfter(/databases/$(database)/documents/transfers/$(documentId)).data.createdByUid == request.auth.uid
+        && (getAfter(/databases/$(database)/documents/transfers/$(documentId)).data.sourceBranchId == branchId
+          || getAfter(/databases/$(database)/documents/transfers/$(documentId)).data.targetBranchId == branchId)
+        && request.resource.data.keys().hasOnly([
+          'transferId', 'branchId', 'counterBranchId', 'direction', 'amount',
+          'paymentMode', 'description', 'createdByUid', 'createdAt'
+        ]);
+    }
+
+    match /owners/{ownerUid} {
+      allow read: if isOwner() && ownerUid == request.auth.uid;
+      allow create, update, delete: if false;
+    }
+
+    match /branches/{branchId} {
+      allow read: if (isOwner() && resource.data.ownerUid == request.auth.uid) || hasBranch(branchId);
+      allow create: if isOwner()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.active is bool
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0;
+      allow update: if isOwner()
+        && resource.data.ownerUid == request.auth.uid
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.active is bool
+        && request.resource.data.name is string
+        && request.resource.data.name.size() > 0
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['name', 'address', 'phone', 'ownerName', 'active', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    match /staff/{staffUid} {
+      allow read: if (isOwner() && resource.data.ownerUid == request.auth.uid)
+        || (signedIn() && request.auth.uid == staffUid);
+      allow create, update: if isOwner()
+        && request.resource.data.ownerUid == request.auth.uid
+        && request.resource.data.email is string
+        && request.resource.data.role in ['manager', 'cashier']
+        && request.resource.data.active is bool
+        && request.resource.data.status in ['active', 'disabled']
+        && request.resource.data.assignedBranchIds is list
+        && request.resource.data.permissions is map;
+      allow delete: if isOwner() && resource.data.ownerUid == request.auth.uid;
+    }
+
+    match /workSessions/{sessionId} {
+      allow read: if signedIn() && resource.data.uid == request.auth.uid;
+      allow create: if signedIn()
+        && request.resource.data.uid == request.auth.uid
+        && request.resource.data.assignedBranchIds is list
+        && (isOwner() || (isActiveStaff()
+          && request.resource.data.assignedBranchIds == staffDoc().assignedBranchIds));
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['endedAt', 'active']);
+      allow delete: if false;
+    }
+
+    match /branches/{branchId}/{collectionId}/{documentId} {
+      allow read: if collectionId != 'notifications'
+        && canReadBranchCollection(branchId, collectionId, documentId);
+
+      allow create: if (ownsBranch(branchId)
+          && (!('branchId' in request.resource.data) || request.resource.data.branchId == branchId))
+        || (hasBranch(branchId)
+          && collectionId == 'config'
+          && canWriteBalance(branchId, documentId))
+        || (hasBranch(branchId)
+          && collectionId == 'inventory'
+          && hasPermission('medicine')
+          && validEmptyInventory(branchId, documentId))
+        || (hasBranch(branchId)
+          && collectionId == 'medicines'
+          && (hasPermission('transfer') || hasPermission('stockTransfer'))
+          && request.resource.data.id == documentId
+          && request.resource.data.branchId == branchId
+          && request.resource.data.keys().hasOnly([
+            'id', 'brand', 'generic', 'doseForm', 'strength', 'manufacturer',
+            'category', 'unit', 'reorderLevel', 'branchId'
+          ]))
+        || (hasBranch(branchId)
+          && collectionId != 'notifications'
+          && collectionId != 'config'
+          && collectionId != 'staffSalarySetups'
+          && collectionId != 'salaryPayments'
+          && collectionId != 'ownerAccounts'
+          && collectionId != 'financialLedger'
+          && canCreateBranchCollection(collectionId)
+          && (!('branchId' in request.resource.data) || request.resource.data.branchId == branchId));
+
+      allow update: if (ownsBranch(branchId)
+          && (!('branchId' in request.resource.data) || request.resource.data.branchId == branchId))
+        || (hasBranch(branchId)
+          && collectionId == 'config'
+          && canWriteBalance(branchId, documentId))
+        || (hasBranch(branchId)
+          && collectionId == 'inventory'
+          && hasPermission('medicine')
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(['brand', 'doseForm', 'strength']))
+        || (hasBranch(branchId)
+          && collectionId != 'notifications'
+          && collectionId != 'config'
+          && collectionId != 'staffSalarySetups'
+          && collectionId != 'salaryPayments'
+          && collectionId != 'ownerAccounts'
+          && collectionId != 'financialLedger'
+          && canUpdateBranchCollection(collectionId)
+          && (!('branchId' in request.resource.data) || request.resource.data.branchId == branchId));
+
+      allow delete: if ownsBranch(branchId)
+        || (hasBranch(branchId) && (
+          (collectionId == 'shortList' && (hasPermission('inventory') || hasPermission('pos')))
+          || (collectionId == 'medicines' && hasPermission('medicine'))
+          || (collectionId == 'customers' && hasPermission('customers'))
+          || (collectionId == 'suppliers' && hasPermission('suppliers'))
+          || (collectionId == 'inventory' && hasPermission('medicine')
+            && resource.data.get('totalStock', 0) == 0
+            && resource.data.get('batches', []) is list
+            && resource.data.get('batches', []).size() == 0)
+          || (isManager() && collectionId == 'sales' && hasPermission('pos'))
+          || (isManager() && collectionId == 'purchases' && hasPermission('purchase'))
+          || (collectionId == 'returns' && hasPermission('returns'))
+          || (collectionId == 'openingEntries' && hasPermission('opening'))
+        ));
+    }
+
+    match /branches/{branchId}/notifications/{notificationId} {
+      allow read: if ownsBranch(branchId);
+      allow create: if (ownsBranch(branchId) || (hasBranch(branchId) && isManager()))
+        && request.resource.data.branchId == branchId
+        && request.resource.data.actorUid is string
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.type is string
+        && request.resource.data.amount is number
+        && request.resource.data.recordId is string
+        && request.resource.data.createdAt == request.time;
+      allow update: if ownsBranch(branchId)
+        && resource.data.branchId == branchId
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(['readByOwner', 'archived', 'updatedAt']);
+      allow delete: if ownsBranch(branchId) && resource.data.branchId == branchId;
+    }
+
+    match /branches/{branchId}/{collectionId}/{documentId}/{subcollectionId}/{subdocumentId} {
+      allow read: if canAccessBranch(branchId)
+        && !(collectionId == 'suppliers' && subcollectionId == 'representatives'
+          && !ownsBranch(branchId) && !hasPermission('suppliers') && !hasPermission('medicine'));
+      allow create, update: if (ownsBranch(branchId)
+          && (!('branchId' in request.resource.data) || request.resource.data.branchId == branchId))
+        || (hasBranch(branchId)
+          && ((subcollectionId == 'items' && collectionPermission(collectionId))
+            || (subcollectionId == 'lines' && (hasPermission('transfer') || hasPermission('stockTransfer')))
+            || (collectionId == 'suppliers' && subcollectionId == 'representatives'
+              && hasPermission('suppliers')))
+          && (!('branchId' in request.resource.data) || request.resource.data.branchId == branchId));
+      allow delete: if ownsBranch(branchId)
+        || (hasBranch(branchId) && collectionId == 'suppliers'
+          && subcollectionId == 'representatives' && hasPermission('suppliers'));
+    }
+
+    match /audits/{auditId} {
+      allow read: if ownsBranch(resource.data.branchId);
+      allow create: if signedIn()
+        && request.resource.data.actorUid == request.auth.uid
+        && request.resource.data.createdAt == request.time
+        && (ownsBranch(request.resource.data.branchId) || hasBranch(request.resource.data.branchId));
+      allow update, delete: if false;
+    }
+
+    match /transfers/{transferId} {
+      allow list: if ownsBranch(resource.data.sourceBranchId)
+        || ownsBranch(resource.data.targetBranchId)
+        || hasBranch(resource.data.sourceBranchId)
+        || hasBranch(resource.data.targetBranchId);
+      allow get: if (!exists(/databases/$(database)/documents/transfers/$(transferId))
+          && signedIn() && (isOwner() || hasPermission('transfer') || hasPermission('stockTransfer')))
+        || ownsBranch(resource.data.sourceBranchId)
+        || ownsBranch(resource.data.targetBranchId)
+        || hasBranch(resource.data.sourceBranchId)
+        || hasBranch(resource.data.targetBranchId);
+      allow create: if signedIn()
+        && request.resource.data.createdByUid == request.auth.uid
+        && (ownsBranch(request.resource.data.sourceBranchId) || hasBranch(request.resource.data.sourceBranchId))
+        && (ownsBranch(request.resource.data.targetBranchId) || hasBranch(request.resource.data.targetBranchId))
+        && (isOwner() || hasPermission('transfer') || hasPermission('stockTransfer'))
+        && request.resource.data.sourceBranchId != request.resource.data.targetBranchId
+        && request.resource.data.status == 'completed'
+        && request.resource.data.completed == true
+        && request.resource.data.lines is list
+        && request.resource.data.lines.size() > 0;
+      allow update, delete: if false;
+    }
+
+    match /branches/{branchId}/{collectionId}/{documentId} {
+      allow create, update: if ownsBranch(branchId)
+        && collectionId == 'financialLedger'
+        && (!('branchId' in request.resource.data) || request.resource.data.branchId == branchId);
+      allow create: if collectionId == 'financialLedger'
+        && validTransferLedger(branchId, documentId);
+    }
+
+    match /globalMedicines/{medicineId} {
+      allow read: if isOwner() || hasPermission('medicine');
+      allow create, update, delete: if isOwner();
+    }
+
+    match /users/{userUid} {
+      allow read, create, update: if isOwner() && userUid == request.auth.uid;
+      allow delete: if false;
+
+      match /config/{documentId} {
+        allow read: if isOwner() && userUid == request.auth.uid && documentId != 'aiSecret';
+        allow create, update: if isOwner() && userUid == request.auth.uid;
+        allow delete: if false;
+      }
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

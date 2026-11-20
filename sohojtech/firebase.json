@@ -1,0 +1,16 @@
+{
+  "hosting": {
+    "public": ".",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**",
+      "firestore_ruled.md",
+      "Code.gs",
+      "AiProxy.gs"
+    ]
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  }
+}

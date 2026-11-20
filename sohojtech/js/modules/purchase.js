@@ -1,0 +1,1702 @@
+'use strict';
+
+// ✅ ফিক্স: pos.js-এর genInvoiceNo()-এর মতো একই কারণে — কলিশন-প্রতিরোধী
+function genPurchaseId() {
+  return 'PUR-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6).toUpperCase();
+}
+
+function genCanonicalBatchId(purchaseId, batchNumber, index) {
+  const normalizedPurchaseId = String(purchaseId || '').replace(/[^A-Za-z0-9_-]/g, '').slice(-12);
+  const normalizedBatch = String(batchNumber || '').trim().replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32);
+  return normalizedBatch
+    ? `BAT-${normalizedBatch}-${normalizedPurchaseId}-${String(index + 1).padStart(2, '0')}`
+    : `BAT-${normalizedPurchaseId}-${String(index + 1).padStart(2, '0')}`;
+}
+// ════════════════════════════════════════════════════════════
+// PURCHASE MODULE
+// ════════════════════════════════════════════════════════════
+// ✅ ফিক্স: sellPrice সরাসরি Inventory-তে রিফ্লেক্ট হয়।
+// ✅ Firestore রিওয়্যার: submitPurchase() এখন apiSubmitPurchase() কল করে,
+//    সফল হলেই APP_STATE-এ optimistic আপডেট হয়।
+// ✅ Tab-switch persistence: সরবরাহকারী, তারিখ, পেমেন্ট টাইপ ও আইটেম এখন
+//    APP_STATE-এ ধরে রাখা হয়, tab পাল্টালে হারায় না।
+// ✅ AI ইনভয়েস-স্ক্যান (Step 4 + money-critical reconciliation): AI কখনো
+//    টাকার arithmetic করে না — শুধু raw unit_tp/unit_vat/qty/line_total_printed
+//    ট্রান্সক্রাইব করে, সব যোগ/গুণ/ভাগ এখানে JS-এ deterministic ভাবে হয়।
+// ✅ গ্রস-ছাড় (সামগ্রিক): প্রতি-লাইন ইনলাইন ছাড় নেই এমন আইটেমগুলোর মধ্যে
+//    গ্রস-মূল্য অনুপাতে বণ্টিত হয় (distributeGrossDiscount)। calcPurTotal()
+//    ও submitPurchase() — দুই জায়গাতেই একই বণ্টন-লজিক ব্যবহার হয়, যাতে UI-তে
+//    দেখানো টোটাল আর Firestore-এ সেভ হওয়া totalCost সবসময় মিলে যায়।
+// ════════════════════════════════════════════════════════════
+
+function renderPurchaseModule() {
+  const container = document.getElementById('purchase-content');
+  APP_STATE.purGrossDiscPct = APP_STATE.purGrossDiscPct || 0;
+  APP_STATE.purGrossDiscAmt = APP_STATE.purGrossDiscAmt || 0;
+  if (!container) return;
+
+  const offlineBanner = !navigator.onLine
+    ? `<div class="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-400 text-xs rounded-lg px-3 py-2 mb-3">
+        <i class="fa-solid fa-triangle-exclamation mr-1"></i> অফলাইন: ক্রয় এন্ট্রি স্থানীয় সিঙ্ক-কিউতে সংরক্ষিত হবে; নেট ফিরলে স্বয়ংক্রিয়ভাবে সিঙ্ক হবে।
+      </div>` : '';
+
+  container.innerHTML = `
+    ${offlineBanner}
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
+      <!-- ══ ক্রয় ফর্ম ══ -->
+      <div class="lg:col-span-2 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5">
+        <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+          <h5 class="text-sm font-semibold text-slate-700 dark:text-slate-200 flex items-center gap-2">
+            <i class="fa-solid fa-cart-flatbed text-brand"></i> নতুন ক্রয় এন্ট্রি
+          </h5>
+          <div class="flex items-center gap-3 flex-wrap">
+            <button onclick="openPurInvoiceScanModal()" class="text-xs text-brand hover:underline flex items-center gap-1">
+              <i class="fa-solid fa-camera"></i> ইনভয়েস OCR স্ক্যান
+            </button>
+            <button onclick="savePurchaseCartAsDraft()" class="text-xs text-brand hover:underline flex items-center gap-1">
+              <i class="fa-solid fa-bookmark"></i> খসড়া সংরক্ষণ করুন
+            </button>
+            <button onclick="openPurchaseDraftsModal()" class="text-xs text-slate-500 hover:underline flex items-center gap-1">
+              <i class="fa-solid fa-layer-group"></i> <span id="purchase-drafts-count">ড্রাফট (0)</span>
+            </button>
+            <button onclick="resetPurchase()" class="text-xs text-red-600 hover:underline flex items-center gap-1">
+              <i class="fa-solid fa-rotate-left"></i> রিসেট
+            </button>
+          </div>
+        </div>
+
+        <div id="pur-error" class="hidden bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-400 text-sm rounded-lg px-3 py-2 mb-3"></div>
+
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-3">
+          <div class="md:col-span-2">
+            <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">সরবরাহকারী <span class="text-red-500">*</span></label>
+            <div id="sd-pur-supplier"></div>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">তারিখ</label>
+            <input type="date" id="pur-date" onchange="APP_STATE.purDate=this.value" class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white outline-none focus:ring-2 focus:ring-brand"/>
+          </div>
+        </div>
+
+        <div class="mb-3">
+          <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">পেমেন্ট ধরন</label>
+          <div class="pur-payment-options flex gap-2">
+            <button type="button" id="pur-pay-cash" onclick="setPurPayType('নগদ')" class="btn pur-payment-option"></button>
+            <button type="button" id="pur-pay-due" onclick="setPurPayType('বাকি')" class="btn pur-payment-option"></button>
+          </div>
+        </div>
+
+        <div id="pur-ai-reconcile-box"></div>
+        <div id="pur-items-list" class="space-y-2 mb-3"></div>
+
+        <button onclick="addPurchaseItem()" class="btn btn-brand-outline btn-sm mb-4">
+          <i class="fa-solid fa-plus"></i> ওষুধ যোগ করুন
+        </button>
+
+        <div class="bg-slate-50 dark:bg-slate-900/30 border border-slate-200 dark:border-slate-600 rounded-lg p-3 mb-4">
+          <div class="flex items-center justify-between mb-2">
+            <label class="text-xs font-semibold text-slate-600 dark:text-slate-300"><i class="fa-solid fa-tags text-brand mr-1"></i> সামগ্রিক (গ্রস) ছাড়</label>
+            <span id="pur-grossdisc-note" class="text-[10px] text-slate-400"></span>
+          </div>
+          <p class="text-[11px] text-slate-400 mb-2">শুধু যেসব আইটেমে ইনলাইন (প্রতি-লাইন) ছাড় নেই, সেগুলোতেই এই ছাড় প্রযোজ্য — অনুপাতে বণ্টিত।</p>
+          <div class="flex gap-2">
+            <div class="flex-1">
+              <label class="block text-[10px] text-slate-400 mb-1">ছাড় %</label>
+              <input type="number" id="pur-grossdisc-pct" value="0" min="0" max="100" step="0.01" oninput="onPurGrossDiscPctChange()"
+                class="w-full px-2 py-1.5 text-sm border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+            </div>
+            <div class="flex-1">
+              <label class="block text-[10px] text-slate-400 mb-1">ছাড় (৳)</label>
+              <input type="number" id="pur-grossdisc-amt" value="0" min="0" step="0.01" oninput="onPurGrossDiscAmtChange()"
+                class="w-full px-2 py-1.5 text-sm border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 gap-3 mb-4">
+          <div>
+            <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">মোট ক্রয়মূল্য (৳)</label>
+            <input type="text" id="pur-total" readonly class="w-full px-3 py-2 text-sm font-mono font-bold bg-brand/10 text-brand border border-brand/30 rounded-lg"/>
+          </div>
+          <div id="pur-note-box" class="flex items-end">
+            <p class="text-[11px] text-slate-400">সরবরাহকারী বাকি: স্বয়ংক্রিয় আপডেট হবে</p>
+          </div>
+        </div>
+
+        <button onclick="submitPurchase()" id="pur-submit-btn" class="btn btn-primary btn-block">
+          <i class="fa-solid fa-boxes-packing"></i> ক্রয় নিশ্চিত করুন
+          <span class="text-[11px] font-normal opacity-70 hidden sm:inline">(Ctrl+Enter)</span>
+        </button>
+      </div>
+
+      <!-- ══ সাইড প্যানেল ══ -->
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden h-fit">
+        <div class="px-4 py-3 border-b border-slate-200 dark:border-slate-700 flex justify-between items-center gap-2">
+          <h6 class="text-sm font-semibold text-slate-700 dark:text-slate-200"><i class="fa-solid fa-clock-rotate-left text-brand mr-1"></i> ক্রয় তালিকা</h6>
+          <input type="date" id="pur-list-date" value="${APP_STATE.purListDate || todayStr()}" onchange="onPurListDateChange(this.value)"
+            class="px-2 py-1 text-xs border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+        </div>
+        <div id="pur-today-list" class="max-h-96 overflow-y-auto"></div>
+      </div>
+    </div>
+  `;
+
+  initPurSupplierDropdown();
+  document.getElementById('pur-date').value = APP_STATE.purDate || todayStr();
+  if (!APP_STATE.purItems || !APP_STATE.purItems.length) { APP_STATE.purItems = []; addPurchaseItem(); }
+  else { renderPurItems(); }
+  if (!APP_STATE.purPayType) APP_STATE.purPayType = 'নগদ';
+  updatePurPayTypeUI();
+  calcPurTotal();
+  renderTodayPurchases();
+  renderPurchaseDraftBadge(); // ✅ নতুন — ক্রয়-খসড়া সংখ্যা
+
+  setTimeout(() => focusPurMedicineInput(0), 50);
+}
+
+
+function onPurGrossDiscPctChange() {
+  const pct = clamp(parseFloat(document.getElementById('pur-grossdisc-pct').value) || 0, 0, 100);
+  APP_STATE.purGrossDiscPct = pct;
+  calcPurTotal();
+}
+function onPurGrossDiscAmtChange() {
+  const eligibleGross = round2(APP_STATE.purItems.filter(it => !(it.discountAmt > 0))
+    .reduce((a, it) => a + getPurLineGross(it), 0));
+  const amt = clamp(parseFloat(document.getElementById('pur-grossdisc-amt').value) || 0, 0, eligibleGross);
+  APP_STATE.purGrossDiscPct = eligibleGross > 0 ? round2((amt / eligibleGross) * 100) : 0;
+  calcPurTotal();
+}
+// ────────────────────────────────────────────────────────────
+// SUPPLIER DROPDOWN
+// ────────────────────────────────────────────────────────────
+function initPurSupplierDropdown() {
+  const opts = APP_STATE.suppliers.map(s => ({
+    value: s.id, label: s.name, sub: s.phone || '',
+    badge: s.totalPayable > 0 ? `বাকি ৳${fmt(s.totalPayable)}` : null,
+    badgeClass: 'bg-amber-50 text-amber-600',
+  }));
+  createSD('sd-pur-supplier', opts, (v) => { APP_STATE.purSupplierId = v; }, '— সরবরাহকারী খুঁজুন —');
+  if (APP_STATE.purSupplierId) {
+    const matched = opts.find(o => o.value === APP_STATE.purSupplierId);
+    if (matched) sdSelect('sd-pur-supplier', matched.value, matched.label);
+    else APP_STATE.purSupplierId = null;
+  }
+}
+
+// ────────────────────────────────────────────────────────────
+// PAYMENT TYPE TOGGLE
+// ────────────────────────────────────────────────────────────
+function setPurPayType(type) {
+  APP_STATE.purPayType = type;
+  updatePurPayTypeUI();
+}
+
+function updatePurPayTypeUI() {
+  const isCash = APP_STATE.purPayType === 'নগদ';
+  const cashBtn = document.getElementById('pur-pay-cash');
+  const dueBtn = document.getElementById('pur-pay-due');
+  if (!cashBtn) return;
+  cashBtn.textContent = 'নগদ';
+  dueBtn.textContent = 'সরবরাহকারী বাকি';
+  cashBtn.className = `btn pur-payment-option ${isCash ? 'btn-primary' : 'btn-secondary'}`;
+  dueBtn.className = `btn pur-payment-option ${!isCash ? 'btn-warning' : 'btn-secondary'}`;
+  const noteBox = document.getElementById('pur-note-box');
+  noteBox.innerHTML = isCash
+    ? `<p class="text-[11px] text-slate-400">নগদে ক্রয় — আজকের Cash Flow-এ ব্যয় হিসেবে যোগ হবে</p>`
+    : `<p class="text-[11px] text-amber-600"><i class="fa-solid fa-triangle-exclamation mr-1"></i>সরবরাহকারীর পাওনা বাড়বে; নগদ ব্যয় হবে না</p>`;
+}
+
+// ────────────────────────────────────────────────────────────
+// ITEM ROWS
+// ────────────────────────────────────────────────────────────
+function addPurchaseItem() {
+  APP_STATE.purItems.push({
+    medId: '', brand: '', qty: 1, purchasePrice: 0, mrp: 0, sellPrice: 0, expiryDate: '',
+    batchNumber: '', discountPct: 0, discountAmt: 0,
+  });
+  renderPurItems();
+}
+
+function removePurchaseItem(i) {
+  if (APP_STATE.purItems.length <= 1) { toast('কমপক্ষে একটি সারি থাকতে হবে।', 'w'); return; }
+  closeMedDisambiguation();
+  APP_STATE.purItems.splice(i, 1);
+  renderPurItems();
+  calcPurTotal();
+}
+
+function renderPurItems() {
+  const container = document.getElementById('pur-items-list');
+  if (!container) return;
+
+  container.innerHTML = APP_STATE.purItems.map((item, i) => {
+    const displayVal = item.medId ? buildPurMedDisplayText(item) : (item.aiRawBrand || '');
+    const aiBadge = item.aiScanned
+      ? (item.aiMatched
+          ? `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-emerald-50 text-emerald-600 ml-1">✨ AI যাচাই করেছে</span>`
+          : `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600 ml-1" title="AI পড়েছে: ${esc(item.aiRawBrand || '')}">⚠️ AI: মেলেনি, নির্বাচন করুন</span>`)
+      : '';
+    const priceBadge = item.aiScanned ? (() => {
+      if (item.aiPriceStatus === 'verified') return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-blue-50 text-blue-600 ml-1" title="ইনভয়েসের লাইন-টোটালের সাথে মিলেছে">💰 দাম যাচাই হয়েছে</span>`;
+      if (item.aiPriceStatus === 'mismatch') return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-red-50 text-red-600 ml-1" title="ইনভয়েসে ছাপা: ৳${fmt(item.aiLineTotalPrinted || 0)}, হিসাবকৃত: ৳${fmt(getPurLineGross(item))}">⚠️ দামে অমিল — চেক করুন</span>`;
+      return `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-slate-100 text-slate-500 ml-1">দাম স্বয়ং-যাচাই করুন</span>`;
+    })() : '';
+    const doseFormBadge = item.aiScanned && item.aiDoseFormMismatch
+      ? `<span class="text-[10px] font-semibold px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-600 ml-1" title="AI packaging দেখে '${esc(item.aiUnitType)}' মনে করেছে, কিন্তু ওষুধ মাস্টারে ডোজ-ফর্ম '${esc(item.doseForm)}' — মিলছে না">🔀 ডোজ-ফর্ম অমিল</span>`
+      : '';
+    // ✅ নতুন — মাস্টারে নেই এমন আইটেমের জন্য দ্রুত-যোগ লিংক
+    const quickAddLink = !item.medId
+      ? `<button type="button" onclick="openQuickAddMedicineFromPurchase(${i})" class="text-[10px] text-brand hover:underline mt-1 block">
+          <i class="fa-solid fa-plus mr-1"></i>ওষুধ মাস্টারে নেই? দ্রুত নতুন যোগ করুন
+        </button>` : '';
+
+    // ✅ নতুন — প্রতি-লাইন ছাড় (% ↔ ৳ বাইডাইরেকশনাল)
+    const gross = getPurLineGross(item);
+    const net = round2(gross - (item.discountAmt || 0));
+    const discountRow = `
+      <div class="pur-discount-row col-span-12 flex flex-wrap items-end gap-2 mt-1 pt-2 border-t border-dashed border-slate-200 dark:border-slate-600">
+        <div class="w-20">
+          <label class="block text-[10px] text-slate-400 mb-1">ছাড় %</label>
+          <input type="number" id="pur-discpct-${i}" value="${item.discountPct || 0}" min="0" max="100" step="0.01"
+            oninput="onPurDiscountPctChange(${i})" onblur="onPurDiscountBlur(${i})"
+            class="w-full px-2 py-1 text-xs border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+        </div>
+        <div class="w-24">
+          <label class="block text-[10px] text-slate-400 mb-1">ছাড় (৳)</label>
+          <input type="number" id="pur-discamt-${i}" value="${item.discountAmt || 0}" min="0" step="0.01"
+            oninput="onPurDiscountAmtChange(${i})" onblur="onPurDiscountBlur(${i})"
+            class="w-full px-2 py-1 text-xs border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+        </div>
+        ${item.discountAmt > 0 ? `<div class="text-[11px] text-slate-400 ml-auto self-center">গ্রস ৳${fmt(gross)} → নেট ৳${fmt(net)}</div>` : ''}
+      </div>`;
+    return `
+    <div class="pur-item-card border border-slate-200 dark:border-slate-600 rounded-lg p-3 relative bg-slate-50 dark:bg-slate-900/30">
+      <button onclick="removePurchaseItem(${i})" class="absolute top-2 right-2 text-slate-400 hover:text-red-500">
+        <i class="fa-solid fa-xmark"></i>
+      </button>
+      <div class="pur-item-grid grid gap-2">
+        <div class="pur-med-field">
+          <label class="block text-[11px] text-slate-400 mb-1 flex items-center flex-wrap">ওষুধ <span class="text-red-500">*</span>${aiBadge}${priceBadge}${doseFormBadge}</label>
+          <input type="text" id="pur-med-input-${i}" list="pur-med-list-${i}" value="${esc(displayVal)}"
+            placeholder="— ওষুধ সার্চ করুন —" autocomplete="off"
+            onchange="onPurMedicineChange(${i})" onkeydown="onPurMedicineKeydown(event, ${i})"
+            class="w-full px-2.5 py-1.5 text-sm border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white outline-none focus:ring-2 focus:ring-brand"/>
+          <datalist id="pur-med-list-${i}">
+            ${APP_STATE.medicines.map(m => `<option value="${esc(m.brand + ' ' + (m.doseForm||'') + ' ' + (m.strength||''))}"></option>`).join('')}
+          </datalist>
+          ${quickAddLink}
+        </div>
+        <div class="pur-qty-field">
+          <label class="block text-[11px] text-slate-400 mb-1">Qty</label>
+          <input type="number" id="pur-qty-${i}" value="${item.qty}" min="1" onkeydown="onPurFieldKeydown(event,${i})" oninput="onPurFieldChange(${i})" onblur="onPurFieldBlur(${i})"
+            class="w-full px-2 py-1.5 text-sm border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div class="pur-price-field">
+          <label class="block text-[11px] text-slate-400 mb-1">ক্রয় মূল্য / ইউনিট</label>
+          <input type="number" id="pur-price-${i}" value="${item.purchasePrice}" min="0" step="0.01" onkeydown="onPurFieldKeydown(event,${i})" oninput="onPurFieldChange(${i})" onblur="onPurFieldBlur(${i})"
+            class="w-full px-2 py-1.5 text-sm border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div class="pur-mrp-field">
+          <label class="block text-[11px] text-slate-400 mb-1">MRP</label>
+          <input type="number" id="pur-mrp-${i}" value="${item.mrp}" min="0" step="0.01" onkeydown="onPurFieldKeydown(event,${i})" oninput="onPurFieldChange(${i})" onblur="onPurFieldBlur(${i})"
+            class="w-full px-2 py-1.5 text-sm border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div class="pur-sell-field">
+          <label class="block text-[11px] text-slate-400 mb-1">বিক্রয় মূল্য</label>
+          <input type="number" id="pur-sell-${i}" value="${item.sellPrice}" min="0" step="0.01" onkeydown="onPurFieldKeydown(event,${i})" oninput="onPurFieldChange(${i})" onblur="onPurFieldBlur(${i})"
+            class="w-full px-2 py-1.5 text-sm border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div class="pur-expiry-field">
+          <label class="block text-[11px] text-slate-400 mb-1">মেয়াদ</label>
+          <input type="text" id="pur-exp-${i}" value="${esc(item.expiryDate)}" placeholder="MM/YYYY" onkeydown="onPurFieldKeydown(event,${i})" oninput="onPurFieldChange(${i})"
+            class="w-full px-2 py-1.5 text-sm border border-slate-300 dark:border-slate-600 rounded-md bg-white dark:bg-slate-700 text-slate-800 dark:text-white outline-none focus:ring-2 focus:ring-brand"/>
+        </div>
+        <div class="pur-total-field flex flex-col justify-end">
+          <label class="block text-[11px] text-slate-400 mb-1">লাইন টোটাল</label>
+          <div id="pur-linetotal-${i}" class="pur-line-total px-2 py-1.5 text-sm font-mono font-bold text-brand whitespace-nowrap tabular-nums">৳০.০০</div>
+        </div>
+        ${discountRow}
+      </div>
+    </div>`;
+  }).join('');
+
+  APP_STATE.purItems.forEach((_, i) => updatePurLineTotal(i));
+}
+
+function buildPurMedDisplayText(item) {
+  return `${item.brand} ${item.doseForm || ''} ${item.strength || ''}`.trim();
+}
+
+function resolvePurMedicineInput(i, opts = {}) {
+  const inputEl = document.getElementById(`pur-med-input-${i}`);
+  if (!inputEl) return;
+  const val = inputEl.value;
+  const textFn = (m) => `${m.brand} ${m.doseForm || ''} ${m.strength || ''}`.trim();
+  const result = resolveMedicineMatch(val, APP_STATE.medicines, textFn);
+  if (result.type === 'exact') {
+    closeMedDisambiguation();
+    applyMedicineToPurItem(i, result.match);
+    if (opts.onResolved) opts.onResolved(result.match);
+    return;
+  }
+  if (result.type === 'ambiguous') {
+    showMedDisambiguation(inputEl, result.matches, textFn, (chosen) => {
+      inputEl.value = textFn(chosen);
+      applyMedicineToPurItem(i, chosen);
+      if (opts.onResolved) opts.onResolved(chosen);
+    });
+    return;
+  }
+  applyMedicineToPurItem(i, null);
+  if (opts.notFoundToast && val.trim()) toast('ওষুধ খুঁজে পাওয়া যায়নি।', 'w');
+}
+
+function onPurMedicineChange(i) {
+  resolvePurMedicineInput(i);
+}
+
+function applyMedicineToPurItem(i, med) {
+  if (med) {
+    const previous = APP_STATE.purItems[i];
+    const inv = APP_STATE.inventory.find(x => x.medId === med.id);
+    const lastBatch = inv?.batches?.[0];
+    APP_STATE.purItems[i] = {
+      medId: med.id, brand: med.brand, doseForm: med.doseForm, strength: med.strength,
+      qty: previous.ocrReviewed ? previous.qty : (previous.qty || 1),
+      batchNumber: previous.ocrReviewed ? previous.batchNumber : '',
+      purchasePrice: previous.ocrReviewed ? previous.purchasePrice : (lastBatch?.cost || 0),
+      mrp: previous.ocrReviewed ? previous.mrp : (lastBatch?.mrp || 0),
+      sellPrice: previous.ocrReviewed ? previous.sellPrice : (inv?.sellPrice || 0),
+      expiryDate: previous.ocrReviewed ? previous.expiryDate : '',
+      discountPct: previous.ocrReviewed ? previous.discountPct : 0,
+      discountAmt: previous.ocrReviewed ? previous.discountAmt : 0,
+      ocrReviewed: previous.ocrReviewed || false,
+    };
+    document.getElementById(`pur-price-${i}`).value = APP_STATE.purItems[i].purchasePrice;
+    document.getElementById(`pur-mrp-${i}`).value = APP_STATE.purItems[i].mrp;
+    document.getElementById(`pur-sell-${i}`).value = APP_STATE.purItems[i].sellPrice;
+    const discPctEl = document.getElementById(`pur-discpct-${i}`);
+    const discAmtEl = document.getElementById(`pur-discamt-${i}`);
+    if (discPctEl) discPctEl.value = 0;
+    if (discAmtEl) discAmtEl.value = 0;
+  } else {
+    const previous = APP_STATE.purItems[i];
+    APP_STATE.purItems[i] = previous.ocrReviewed
+      ? { ...previous, medId: '', brand: '', doseForm: '', strength: '' }
+      : { medId: '', brand: '', qty: 1, purchasePrice: 0, mrp: 0, sellPrice: 0, expiryDate: '', batchNumber: '', discountPct: 0, discountAmt: 0 };
+  }
+  updatePurLineTotal(i);
+  calcPurTotal();
+}
+
+function getPurLineGross(item) {
+  return round2((item.qty || 0) * (item.purchasePrice || 0));
+}
+
+function onPurFieldChange(i) {
+  const qty = Math.max(0, parseFloat(document.getElementById(`pur-qty-${i}`).value) || 0);
+  const purchasePrice = Math.max(0, parseFloat(document.getElementById(`pur-price-${i}`).value) || 0);
+  const mrp = Math.max(0, parseFloat(document.getElementById(`pur-mrp-${i}`).value) || 0);
+  const sellPrice = Math.max(0, parseFloat(document.getElementById(`pur-sell-${i}`).value) || 0);
+
+  const item = APP_STATE.purItems[i];
+  item.qty = qty;
+  item.purchasePrice = purchasePrice;
+  item.mrp = mrp;
+  item.sellPrice = sellPrice;
+  item.expiryDate = document.getElementById(`pur-exp-${i}`).value || '';
+
+  // ✅ নতুন — qty/price বদলালে discountPct অক্ষত রেখে discountAmt পুনর্গণনা
+  const gross = round2(qty * purchasePrice);
+  item.discountAmt = round2(gross * (item.discountPct || 0) / 100);
+  const discAmtEl = document.getElementById(`pur-discamt-${i}`);
+  if (discAmtEl) discAmtEl.value = item.discountAmt;
+
+  updatePurLineTotal(i);
+  calcPurTotal();
+}
+
+// ✅ নতুন — ছাড় % বদলালে amount পুনর্গণনা
+function onPurDiscountPctChange(i) {
+  const item = APP_STATE.purItems[i];
+  if (!item) return;
+  const pct = clamp(parseFloat(document.getElementById(`pur-discpct-${i}`).value) || 0, 0, 100);
+  const gross = getPurLineGross(item);
+  item.discountPct = pct;
+  item.discountAmt = round2(gross * pct / 100);
+  const amtEl = document.getElementById(`pur-discamt-${i}`);
+  if (amtEl) amtEl.value = item.discountAmt;
+  updatePurLineTotal(i);
+  calcPurTotal();
+}
+
+// ✅ নতুন — ছাড় ৳ বদলালে percentage ব্যাক-ক্যালকুলেট
+function onPurDiscountAmtChange(i) {
+  const item = APP_STATE.purItems[i];
+  if (!item) return;
+  const gross = getPurLineGross(item);
+  const amt = clamp(parseFloat(document.getElementById(`pur-discamt-${i}`).value) || 0, 0, gross);
+  item.discountAmt = amt;
+  item.discountPct = gross > 0 ? round2((amt / gross) * 100) : 0;
+  const pctEl = document.getElementById(`pur-discpct-${i}`);
+  if (pctEl) pctEl.value = item.discountPct;
+  updatePurLineTotal(i);
+  calcPurTotal();
+}
+
+function onPurDiscountBlur(i) {
+  const item = APP_STATE.purItems[i];
+  if (!item) return;
+  const pctEl = document.getElementById(`pur-discpct-${i}`);
+  const amtEl = document.getElementById(`pur-discamt-${i}`);
+  if (pctEl) pctEl.value = item.discountPct || 0;
+  if (amtEl) amtEl.value = item.discountAmt || 0;
+}
+
+// ────────────────────────────────────────────────────────────
+// ✅ TOTAL — একমাত্র সংজ্ঞা (আগে দুইবার ডুপ্লিকেট ছিল, দ্বিতীয়টা
+// প্রথমটাকে override করে ছাড়/গ্রস-ছাড় দুটোই বাদ দিয়ে ফেলত — ফিক্সড)
+// ইনলাইন ছাড় নেই এমন আইটেমগুলোর মধ্যে গ্রস-ছাড় বণ্টিত হয়ে
+// প্রতিটির item._effectiveDiscountAmt-এ বসে, যেটা updatePurLineTotal()
+// এবং submitPurchase() দুই জায়গাতেই ব্যবহৃত হয়।
+// ────────────────────────────────────────────────────────────
+function calcPurTotal() {
+  const eligibleGross = round2(APP_STATE.purItems.filter(it => !(it.discountAmt > 0))
+    .reduce((a, it) => a + (it.qty || 0) * (it.purchasePrice || 0), 0));
+  APP_STATE.purGrossDiscPct = APP_STATE.purGrossDiscPct || 0;
+  APP_STATE.purGrossDiscAmt = round2(eligibleGross * APP_STATE.purGrossDiscPct / 100);
+
+  const grossMap = distributeGrossDiscount(
+    APP_STATE.purItems, APP_STATE.purGrossDiscAmt,
+    it => getPurLineGross(it), it => it.discountAmt || 0
+  );
+
+  let total = 0;
+  APP_STATE.purItems.forEach(item => {
+    const gross = getPurLineGross(item);
+    const inline = item.discountAmt || 0;
+    const effective = inline > 0 ? inline : (grossMap.get(item) || 0);
+    item._effectiveDiscountAmt = effective;
+    total += (gross - effective);
+  });
+
+  document.getElementById('pur-total').value = round2(total).toFixed(2);
+
+  const gdAmtEl = document.getElementById('pur-grossdisc-amt');
+  const gdPctEl = document.getElementById('pur-grossdisc-pct');
+  if (gdAmtEl && document.activeElement !== gdAmtEl) gdAmtEl.value = APP_STATE.purGrossDiscAmt;
+  if (gdPctEl && document.activeElement !== gdPctEl) gdPctEl.value = APP_STATE.purGrossDiscPct;
+  const gdNoteEl = document.getElementById('pur-grossdisc-note');
+  if (gdNoteEl) gdNoteEl.textContent = eligibleGross > 0 ? `প্রযোজ্য আইটেম-গ্রস: ৳${fmt(eligibleGross)}` : 'কোনো যোগ্য আইটেম নেই';
+
+  APP_STATE.purItems.forEach((_, i) => updatePurLineTotal(i));
+  renderAiReconciliationBanner(round2(total));
+}
+
+// ✅ ধাপ ০.২: blur-sync (pos.js-এর একই প্যাটার্ন)
+function onPurFieldBlur(i) {
+  const item = APP_STATE.purItems[i];
+  if (!item) return;
+  const qtyEl = document.getElementById(`pur-qty-${i}`);
+  const priceEl = document.getElementById(`pur-price-${i}`);
+  const mrpEl = document.getElementById(`pur-mrp-${i}`);
+  const sellEl = document.getElementById(`pur-sell-${i}`);
+  if (qtyEl) qtyEl.value = item.qty;
+  if (priceEl) priceEl.value = item.purchasePrice;
+  if (mrpEl) mrpEl.value = item.mrp;
+  if (sellEl) sellEl.value = item.sellPrice;
+}
+
+// ✅ পরিবর্তন — এখন ইনলাইন বা গ্রস-বণ্টিত (effective) ছাড় যেটা প্রযোজ্য সেটা দেখায়
+function updatePurLineTotal(i) {
+  const item = APP_STATE.purItems[i];
+  const gross = getPurLineGross(item);
+  const effective = item.discountAmt > 0 ? item.discountAmt : (item._effectiveDiscountAmt || 0);
+  const net = round2(gross - effective);
+  const el = document.getElementById(`pur-linetotal-${i}`);
+  if (!el) return;
+  el.innerHTML = effective > 0
+    ? `<span class="line-through text-slate-400 text-[10px] block">৳${fmt(gross)}</span>৳${fmt(net)}`
+    : '৳' + fmt(net);
+}
+
+// ────────────────────────────────────────────────────────────
+// ⌨️ KEYBOARD FLOW
+// ────────────────────────────────────────────────────────────
+function onPurMedicineKeydown(e, i) {
+  const inputEl = document.getElementById(`pur-med-input-${i}`);
+  if (isMedDisambiguationOpenFor(inputEl) && medDisambiguationHandleKey(e)) return;
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  resolvePurMedicineInput(i, {
+    notFoundToast: true,
+    onResolved: () => {
+      document.getElementById(`pur-qty-${i}`)?.focus();
+      document.getElementById(`pur-qty-${i}`)?.select();
+    },
+  });
+}
+
+function onPurFieldKeydown(e, i) {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (i + 1 >= APP_STATE.purItems.length) {
+      addPurchaseItem();
+      setTimeout(() => focusPurMedicineInput(APP_STATE.purItems.length - 1), 30);
+    } else {
+      focusPurMedicineInput(i + 1);
+    }
+  }
+}
+
+function focusPurMedicineInput(i) {
+  document.getElementById(`pur-med-input-${i}`)?.focus();
+}
+
+document.addEventListener('keydown', (e) => {
+  if (APP_STATE.currentTab === 'purchase' && e.ctrlKey && e.key === 'Enter') {
+    e.preventDefault();
+    submitPurchase();
+  }
+});
+
+// ────────────────────────────────────────────────────────────
+// ✅ SUBMIT — এখন async, apiSubmitPurchase() সফল হলেই APP_STATE আপডেট হয়
+// ────────────────────────────────────────────────────────────
+async function submitPurchase() {
+  if (guardReadOnly()) return;
+  hideEl('pur-error');
+  const supId = sdGetValue('sd-pur-supplier');
+  const date = document.getElementById('pur-date').value || todayStr();
+  const payType = APP_STATE.purPayType || 'নগদ';
+  const validItems = APP_STATE.purItems.filter(i => i.medId && i.qty > 0 && i.purchasePrice >= 0);
+
+  if (!supId) return showPurError('সরবরাহকারী নির্বাচন করুন।');
+  if (!validItems.length) return showPurError('কমপক্ষে একটি ওষুধ যোগ করুন।');
+
+  calcPurTotal(); // ✅ item._effectiveDiscountAmt (ইনলাইন + গ্রস-বণ্টিত) ফ্রেশ নিশ্চিত
+
+  const supplier = APP_STATE.suppliers.find(s => s.id === supId);
+  const purchaseId = genPurchaseId();
+
+  // ✅ গ্রস থেকে টোটাল (ইনলাইন + গ্রস-বণ্টিত ছাড় বাদ দিয়ে) হিসাব, এবং প্রতিটা
+  // আইটেমে purchasePrice-কে নেট-ইউনিট-কস্টে কনভার্ট (downstream batch cost/COGS-এর
+  // জন্য), গ্রস/ছাড় আলাদা ফিল্ডে রেকর্ড রাখা হচ্ছে অডিট-ট্রেইলের জন্য
+  let totalCost = 0;
+  const itemsWithReorder = validItems.map((i, idx) => {
+    const med = APP_STATE.medicines.find(m => m.id === i.medId);
+    const gross = getPurLineGross(i);
+    const effectiveDiscount = Math.min(i._effectiveDiscountAmt || 0, gross);
+    const netLine = round2(gross - effectiveDiscount);
+    const qty = Math.floor(Math.max(0, Number(i.qty) || 0));
+    if (!qty) return null;
+    const netUnitCost = round2(netLine / qty);
+    totalCost += netLine;
+    // ✅ ফিক্স: _effectiveDiscountAmt স্ক্র্যাচ ফিল্ড স্ট্রিপ করে বাদ (Firestore-এ leak করছিল)
+    const { _effectiveDiscountAmt, ...rest } = i;
+    const batchSuffix = genCanonicalBatchId(purchaseId, '', idx);
+    return {
+      ...rest,
+      batchNumber: batchSuffix,
+      batchId: batchSuffix,
+      grossUnitPrice: i.purchasePrice,
+      qty,
+      discountAmt: effectiveDiscount,
+      discountPct: gross > 0 ? round2((effectiveDiscount / gross) * 100) : 0,
+      discountSource: effectiveDiscount <= 0 ? 'none' : ((i.discountAmt || 0) > 0 ? 'inline' : 'gross'),
+      purchasePrice: netUnitCost,
+      reorderLevel: getEffectiveReorderLevel(med),
+    };
+  });
+  totalCost = round2(totalCost);
+
+  const purchase = {
+    purchaseId, date, supplierId: supId, supplierName: supplier?.name || supId,
+    branchId: APP_STATE.activeBranchId,
+    createdByUid: APP_STATE.currentUser?.uid || null,
+    items: itemsWithReorder,
+    totalCost, paymentType: payType,
+    medicineName: validItems.map(i => i.brand).join(', '),
+    grossDiscountPct: APP_STATE.purGrossDiscPct || 0, // ✅ নতুন — রিসিটে/অডিটে সামগ্রিক ছাড়%
+  };
+
+  const btn = document.getElementById('pur-submit-btn');
+  const idleHTML = '<i class="fa-solid fa-boxes-packing"></i> ক্রয় নিশ্চিত করুন <span class="text-[11px] font-normal opacity-70 hidden sm:inline">(Ctrl+Enter)</span>';
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> প্রক্রিয়াকরণ হচ্ছে...';
+
+  try {
+    const res = await apiSubmitPurchase(purchase);
+    if (!res.success) {
+      showPurError(res.message);
+      btn.disabled = false;
+      btn.innerHTML = idleHTML;
+      return;
+    }
+
+    if (res.queued) {
+      toast(res.message, 'w');
+      resetPurchase();
+      refreshSyncBadge();
+      openReceiptModal('purchase', purchase);
+    } else {
+      // ✅ ফিক্স: validItems না, itemsWithReorder ব্যবহার — এতে local mirror-এর
+      // batch cost Firestore-এ কমিট হওয়া নেট-কস্টের সাথে সামঞ্জস্যপূর্ণ থাকে
+      itemsWithReorder.forEach(item => addPurchaseBatch(item, date));
+      APP_STATE.purchases.push(purchase);
+      if (supplier) {
+        if (payType === 'বাকি') applySupplierPayableChange(supId, totalCost, 0);
+        else applySupplierPayableChange(supId, 0, totalCost);
+      }
+      toast(res.message, 's');
+      resetPurchase();
+      renderTodayPurchases();
+      openReceiptModal('purchase', purchase);
+    }
+    btn.disabled = false;
+    btn.innerHTML = idleHTML;
+  } catch (err) {
+    showFatalError('ক্রয় সংরক্ষণে সমস্যা:\n' + humanizeError(err), err);
+    btn.disabled = false;
+    btn.innerHTML = idleHTML;
+  }
+}
+
+// ✅ ফিক্স: sellPrice সরাসরি Inventory-তে আপডেট হচ্ছে
+function addPurchaseBatch(item, date) {
+  const inv = APP_STATE.inventory.find(m => m.medId === item.medId);
+  if (!inv) return;
+  const batchNumber = String(item.batchNumber || '').trim();
+  const fallbackId = String(item.batchId || '').trim()
+    || genCanonicalBatchId(item.purchaseId || 'LEGACY', batchNumber, 0);
+  const batchId = item.batchId || fallbackId;
+  const existing = inv.batches.find(b =>
+    (batchNumber && b.batchNumber === batchNumber) || b.batchId === batchId
+  );
+  if (existing) {
+    item.batchId = existing.batchId;
+    existing.stock = (existing.stock || 0) + item.qty;
+    existing.cost = item.purchasePrice;
+    existing.mrp = item.mrp;
+    existing.sell = item.sellPrice || existing.sell || inv.sellPrice;
+    existing.expiry = item.expiryDate || existing.expiry || '';
+    existing.batchNumber = batchNumber || existing.batchNumber || existing.batchId;
+    if (item.unitsPerStrip !== undefined) existing.unitsPerStrip = positivePackNumber(item.unitsPerStrip, existing.unitsPerStrip || 1);
+    if (item.stripsPerBox !== undefined) existing.stripsPerBox = positivePackNumber(item.stripsPerBox, existing.stripsPerBox || 1);
+  } else {
+    inv.batches.push({
+      batchId, batchNumber: batchNumber || batchId,
+      expiry: item.expiryDate || '', stock: item.qty,
+      cost: item.purchasePrice, mrp: item.mrp, sell: item.sellPrice || inv.sellPrice,
+      ...(item.unitsPerStrip !== undefined ? { unitsPerStrip: positivePackNumber(item.unitsPerStrip, 1) } : {}),
+      ...(item.stripsPerBox !== undefined ? { stripsPerBox: positivePackNumber(item.stripsPerBox, 1) } : {}),
+    });
+  }
+  inv.batches.sort((a, b) => compareBatchExpiry(a, b, 'asc')); // ✅ ধাপ ৩১ ফিক্স
+  inv.totalStock = inv.batches.reduce((a, b) => a + b.stock, 0);
+  inv.costValue = round2(inv.batches.reduce((a, b) => a + b.cost * b.stock, 0));
+  inv.mrpValue = round2(inv.batches.reduce((a, b) => a + b.mrp * b.stock, 0));
+  inv.nearestExpiry = inv.batches[0]?.expiry || '';
+  if (item.sellPrice > 0) inv.sellPrice = item.sellPrice;
+
+  const med = APP_STATE.medicines.find(m => m.id === item.medId);
+  const reorderLevel = getEffectiveReorderLevel(med);
+  inv.status = inv.totalStock === 0 ? 'out' : inv.totalStock <= reorderLevel ? 'low' : 'ok';
+}
+
+function showPurError(msg) {
+  const el = document.getElementById('pur-error');
+  el.textContent = msg;
+  el.classList.remove('hidden');
+  setTimeout(() => el.classList.add('hidden'), 5000);
+}
+
+function resetPurchase() {
+  closeMedDisambiguation();
+  APP_STATE.purDate = null; APP_STATE.purSupplierId = null; APP_STATE.purPayType = 'নগদ';
+  APP_STATE.purItems = [];
+  APP_STATE.purAiInvoiceTotal = null; // ✅ রিসেটে AI-reconciliation স্টেটও পরিষ্কার
+  APP_STATE.purGrossDiscPct = 0; APP_STATE.purGrossDiscAmt = 0; // ✅ নতুন — গ্রস-ছাড় স্টেটও পরিষ্কার
+  sdClear('sd-pur-supplier');
+  addPurchaseItem();
+  updatePurPayTypeUI();
+  calcPurTotal();
+  setTimeout(() => focusPurMedicineInput(0), 50);
+}
+
+// ────────────────────────────────────────────────────────────
+// TODAY'S PURCHASE LIST
+// ────────────────────────────────────────────────────────────
+function onPurListDateChange(val) {
+  APP_STATE.purListDate = val || todayStr();
+  renderTodayPurchases();
+}
+
+function renderTodayPurchases() {
+  const container = document.getElementById('pur-today-list');
+  if (!container) return;
+  const filterDate = APP_STATE.purListDate || todayStr();
+  const listPur = APP_STATE.purchases.filter(p => p.date === filterDate).slice().reverse();
+
+  const capHint = capHintHTML('purchases', 'pur-load-older-btn', 'renderTodayPurchases', 'সাম্প্রতিক ৮,০০০টার বেশি ক্রয় থাকলে পুরনো তারিখের এন্ট্রি এখনো নাও দেখাতে পারে।');
+
+  container.innerHTML = capHint + (listPur.length ? listPur.map(p => `
+    <div class="px-4 py-3 border-b border-slate-100 dark:border-slate-700/50">
+      <div class="flex justify-between items-start">
+        <div class="min-w-0">
+          <div class="text-xs font-mono text-slate-400">${esc(p.purchaseId)}</div>
+          <div class="text-sm font-semibold text-slate-700 dark:text-slate-200 truncate">${esc(p.supplierName)}</div>
+          <div class="text-[11px] text-slate-400 truncate">${esc(p.medicineName)}</div>
+        </div>
+        <div class="text-right flex-shrink-0">
+          <div class="font-mono font-bold text-sm text-slate-800 dark:text-white">৳${fmt(p.totalCost)}</div>
+          <span class="text-[11px] font-semibold ${p.paymentType === 'বাকি' ? 'text-amber-500' : 'text-emerald-500'}">${esc(p.paymentType)}</span>
+          <div class="flex items-center gap-2 justify-end mt-1">
+            <button onclick="reprintPurchaseReceipt('${p.purchaseId}')" class="text-slate-400 hover:text-brand text-xs"><i class="fa-solid fa-print"></i></button>
+            ${APP_STATE.isOwner || APP_STATE.staffRole === 'manager' ? `<button onclick="openEditPurchase('${p.purchaseId}')" class="text-brand hover:text-brand/80 text-xs" title="সম্পাদনা"><i class="fa-solid fa-pen"></i></button>` : ''}
+            ${APP_STATE.isOwner ? `<button onclick="deletePurchaseConfirm('${p.purchaseId}')" class="text-red-400 hover:text-red-600 text-xs"><i class="fa-solid fa-trash"></i></button>` : ''}
+          </div>
+        </div>
+      </div>
+    </div>`).join('')
+    : `<div class="px-4 py-8 text-center text-slate-400 text-sm"><i class="fa-solid fa-truck-field text-2xl opacity-30 mb-2 block"></i>এই তারিখে কোনো ক্রয় নেই</div>`);
+}
+
+// ────────────────────────────────────────────────────────────
+// DELETE PURCHASE
+// ────────────────────────────────────────────────────────────
+async function openEditPurchase(purchaseId) {
+  if (!APP_STATE.isOwner && APP_STATE.staffRole !== 'manager') return toast('শুধু Owner বা Manager ক্রয় সম্পাদনা করতে পারবেন।', 'w');
+  const pur = APP_STATE.purchases.find(p => p.purchaseId === purchaseId);
+  if (!pur) return;
+  closeEditPurchase();
+  const modal = document.createElement('div');
+  modal.id = 'edit-purchase-modal';
+  modal.className = 'fixed inset-0 z-[9010] bg-slate-900/50 flex items-center justify-center p-4';
+  modal.innerHTML = `<div class="bg-white dark:bg-slate-800 rounded-xl shadow-xl w-full max-w-md p-5">
+    <h3 class="font-bold text-slate-800 dark:text-white mb-4">ক্রয় সম্পাদনা — ${esc(purchaseId)}</h3>
+    <div class="space-y-3">
+      <div><label class="text-xs text-slate-500">তারিখ</label><input id="edit-pur-date" type="date" value="${esc(pur.date)}" class="w-full mt-1 px-3 py-2 border rounded-lg"/></div>
+      <div><label class="text-xs text-slate-500">মোট টাকা</label><input id="edit-pur-total" type="number" min="0" step="0.01" value="${pur.totalCost || 0}" class="w-full mt-1 px-3 py-2 border rounded-lg"/></div>
+      <div><label class="text-xs text-slate-500">পেমেন্ট ধরন</label><select id="edit-pur-pay" class="w-full mt-1 px-3 py-2 border rounded-lg"><option ${pur.paymentType === 'নগদ' ? 'selected' : ''}>নগদ</option><option ${pur.paymentType === 'বাকি' ? 'selected' : ''}>বাকি</option></select></div>
+    </div>
+    <div class="flex justify-end gap-2 mt-5"><button onclick="closeEditPurchase()" class="btn btn-secondary">বাতিল</button><button onclick="saveEditPurchase('${esc(purchaseId)}')" class="btn btn-primary">সংরক্ষণ</button></div>
+  </div>`;
+  document.body.appendChild(modal);
+}
+function closeEditPurchase() { document.getElementById('edit-purchase-modal')?.remove(); }
+async function saveEditPurchase(purchaseId) {
+  const pur = APP_STATE.purchases.find(p => p.purchaseId === purchaseId);
+  if (!pur) return;
+  const date = document.getElementById('edit-pur-date')?.value || pur.date;
+  const totalCost = round2(parseFloat(document.getElementById('edit-pur-total')?.value) || 0);
+  const paymentType = document.getElementById('edit-pur-pay')?.value || pur.paymentType;
+  if (totalCost < 0) return toast('সঠিক মোট টাকা দিন।', 'w');
+  const res = await apiUpdatePurchase(purchaseId, { date, totalCost, paymentType });
+  if (!res.success) return toast(res.message, 'w');
+  Object.assign(pur, { date, totalCost, paymentType });
+  await emitFinancialNotification({
+    type: 'purchase_edit', action: 'edited', amount: totalCost, recordId: purchaseId,
+    title: 'ক্রয় রেকর্ড সম্পাদিত', message: `ক্রয় ${purchaseId} সম্পাদনা করেছেন`
+  });
+  closeEditPurchase();
+  toast('ক্রয় রেকর্ড সম্পাদিত হয়েছে।', 's');
+  renderTodayPurchases();
+}
+
+async function deletePurchaseConfirm(purchaseId) {
+  if (guardReadOnly()) return;
+  const pur = APP_STATE.purchases.find(p => p.purchaseId === purchaseId);
+  if (!pur || !confirm(`"${purchaseId}" মুছবেন? স্টক/পাওনা ফেরত হবে।`)) return;
+  try {
+    const res = await apiDeletePurchase(pur);
+    if (!res.success) return toast(res.message, 'w');
+    pur.items.forEach(item => {
+      const inv = APP_STATE.inventory.find(m => m.medId === item.medId);
+      if (inv) {
+        const batch = inv.batches.find(b => b.batchId === item.batchId);
+        if (batch) batch.stock = Math.max(0, round2((batch.stock || 0) - (item.qty || 0)));
+        inv.batches = inv.batches.filter(b => (b.stock || 0) > 0);
+        recalcInventoryRow(inv);
+      }
+    });
+    if (pur.paymentType === 'বাকি') applySupplierPayableChange(pur.supplierId, -pur.totalCost, 0);
+    else applySupplierPayableChange(pur.supplierId, 0, -pur.totalCost);
+    APP_STATE.purchases = APP_STATE.purchases.filter(p => p.purchaseId !== purchaseId);
+    toast(res.message, 's');
+    renderTodayPurchases();
+  } catch (err) { showFatalError('ক্রয় মুছতে সমস্যা:\n' + humanizeError(err), err); }
+}
+
+// ════════════════════════════════════════════════════════════
+// ✅ মাল্টি-পেজ AI ইনভয়েস স্ক্যান — কোনো পেজ-সংখ্যা সীমা নেই।
+// পেজ বাড়লে adaptive compression (tier-ভিত্তিক) দিয়ে প্রতি-পেজ
+// resolution/quality কমে, যাতে মোট payload নিরাপদ সীমায় থাকে।
+// প্রতিটা পেজের আসল File রেফারেন্স রাখা হয় (সংকুচিত dataUrl থেকে
+// না) — যাতে পেজ-সংখ্যা বদলে tier পাল্টালে বারবার কম্প্রেস করলেও
+// generation-loss জমতে না থাকে।
+// ════════════════════════════════════════════════════════════
+const PUR_SCAN_TOTAL_BUDGET_BYTES = 18 * 1024 * 1024; // ~১৮ MB — provider per-request সীমার নিরাপদ মার্জিন
+
+function getPurScanCompressionTier(pageCount) {
+  if (pageCount <= 3)  return { maxDim: 2400, quality: 0.85, maxBytes: 1800 * 1024 };
+  if (pageCount <= 8)  return { maxDim: 1800, quality: 0.75, maxBytes: 900  * 1024 };
+  if (pageCount <= 15) return { maxDim: 1400, quality: 0.65, maxBytes: 550  * 1024 };
+  return                      { maxDim: 1100, quality: 0.55, maxBytes: 350  * 1024 };
+}
+
+function compressInvoiceImageFile(file, tier) {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith('image/')) {
+      reject(new Error('শুধু ছবি ফাইল (JPG/PNG) আপলোড করুন।'));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        let w = img.width, h = img.height;
+        const scale = Math.min(1, tier.maxDim / Math.max(w, h));
+        w = Math.max(1, Math.round(w * scale));
+        h = Math.max(1, Math.round(h * scale));
+        const canvas = document.createElement('canvas');
+        canvas.width = w; canvas.height = h;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, w, h);
+        ctx.drawImage(img, 0, 0, w, h);
+
+        // ✅ tier.maxBytes ছুঁতে না পারলে কোয়ালিটি ধাপে ধাপে কমিয়ে সর্বোচ্চ
+        // ৩ বার রিট্রাই — শেষমেশ না মিললেও শেষ ফলাফলই ব্যবহার হবে, ব্লক করা হয় না
+        let q = tier.quality;
+        let dataUrl = canvas.toDataURL('image/jpeg', q);
+        let attempts = 0;
+        while (dataUrl.length > tier.maxBytes && attempts < 3 && q > 0.35) {
+          q -= 0.15; attempts++;
+          dataUrl = canvas.toDataURL('image/jpeg', q);
+        }
+        resolve(dataUrl);
+      };
+      img.onerror = () => reject(new Error('ছবি পড়া যায়নি — ফাইলটা corrupted হতে পারে।'));
+      img.src = e.target.result;
+    };
+    reader.onerror = () => reject(new Error('ফাইল রিড করতে ব্যর্থ।'));
+    reader.readAsDataURL(file);
+  });
+}
+
+let _purScanPages = []; // [{ id, file, dataUrl }] — ক্রম অনুযায়ী পেজ ১, ২, ৩...
+let _purScanPageIdSeq = 0;
+let _purScanRecompressing = false;
+
+function purScanTotalBytes() {
+  return _purScanPages.reduce((a, p) => a + (p.dataUrl ? p.dataUrl.length : 0), 0);
+}
+
+function openPurInvoiceScanModal() {
+  if (guardReadOnly()) return;
+  if (document.getElementById('pur-scan-modal')) return;
+  _purScanPages = [];
+  _purScanPageIdSeq = 0;
+
+  const modal = document.createElement('div');
+  modal.id = 'pur-scan-modal';
+  modal.className = 'fixed inset-0 z-[9995] bg-black/50 flex items-center justify-center p-4';
+  modal.innerHTML = `
+    <div class="bg-white dark:bg-slate-800 rounded-xl p-6 max-w-lg w-full max-h-[90vh] overflow-y-auto">
+      <h4 class="font-bold text-slate-800 dark:text-white mb-1"><i class="fa-solid fa-camera text-brand mr-1"></i> ইনভয়েস OCR স্ক্যান</h4>
+      <p class="text-xs text-slate-400 mb-4">অনলাইনে অনুমোদিত AI proxy দিয়ে স্ক্যান হতে পারে; proxy ব্যর্থ হলে ব্রাউজার-ভিত্তিক OCR fallback ব্যবহার হবে। OCR-এর প্রতিটি মান অনুমান—সারণিতে যাচাই না করে ক্রয় ফর্মে/স্টক সংরক্ষণে যাবে না। অফলাইনে ম্যানুয়াল এন্ট্রি ব্যবহার করুন।</p>
+      <div id="pur-scan-error" class="hidden bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 text-xs rounded-lg px-3 py-2 mb-3"></div>
+
+      <div id="pur-scan-pages-box" class="grid grid-cols-3 sm:grid-cols-4 gap-2 mb-3"></div>
+      <div id="pur-scan-size-note" class="mb-3"></div>
+
+      <input type="file" id="pur-scan-file" accept="image/jpeg,image/png,image/webp" class="hidden" onchange="onPurScanFileSelect(event)"/>
+      <input type="file" id="pur-scan-camera" accept="image/jpeg,image/png,image/webp" capture="environment" class="hidden" onchange="onPurScanFileSelect(event)"/>
+      <div class="grid grid-cols-2 gap-2 mb-3">
+        <label for="pur-scan-file" class="btn btn-secondary cursor-pointer text-center"><i class="fa-solid fa-folder-open mr-1"></i> সংরক্ষিত ছবি</label>
+        <label for="pur-scan-camera" onclick="purScanSetStatus('ক্যামেরা অনুমতি চাইলে Allow দিন; অনুমতি না দিলে সংরক্ষিত ফাইল বা ম্যানুয়াল এন্ট্রি ব্যবহার করুন।','text-slate-500')" class="btn btn-brand-outline cursor-pointer text-center"><i class="fa-solid fa-camera mr-1"></i> সরাসরি ক্যামেরা</label>
+      </div>
+
+      <div class="flex gap-2">
+        <button id="pur-scan-submit-btn" onclick="runPurInvoiceScan()" class="btn btn-primary flex-1" disabled>
+          <i class="fa-solid fa-wand-magic-sparkles mr-1"></i> স্ক্যান করুন
+        </button>
+        <button onclick="closePurScanModal()" class="btn btn-secondary">বাতিল</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  openAppModal('pur-scan-modal', closePurScanModal);
+  renderPurScanPagesUI();
+}
+
+function closePurScanModal() {
+  document.getElementById('pur-scan-modal')?.remove();
+  _purScanPages = [];
+}
+
+function purScanSetStatus(message, tone) {
+  const errEl = document.getElementById('pur-scan-error');
+  if (!errEl) return;
+  errEl.textContent = message;
+  errEl.className = `bg-slate-50 border border-slate-200 text-xs text-${tone || 'slate-500'} rounded-lg px-3 py-2 mb-3`;
+  errEl.classList.remove('hidden');
+}
+
+async function onPurScanFileSelect(event) {
+  const errEl = document.getElementById('pur-scan-error');
+  errEl.classList.add('hidden');
+  const file = event.target.files[0];
+  event.target.value = ''; // ✅ একই ফাইল আবার সিলেক্ট করলেও change ইভেন্ট ফায়ার হবে
+  if (!file) {
+    purScanSetStatus('ক্যামেরা ফাইল নির্বাচন বাতিল হয়েছে। সংরক্ষিত ছবি বা ম্যানুয়াল ক্রয় এন্ট্রি ব্যবহার করুন।', 'amber-700');
+    return;
+  }
+
+  if (!file.type.startsWith('image/')) {
+    errEl.textContent = 'শুধু ছবি ফাইল (JPG/PNG) আপলোড করুন।';
+    errEl.classList.remove('hidden');
+    return;
+  }
+  if (file.size > 15 * 1024 * 1024) {
+    errEl.textContent = 'প্রতিটি ছবির সাইজ 15 MB-এর কম হতে হবে।';
+    errEl.classList.remove('hidden');
+    return;
+  }
+
+  _purScanPages.push({ id: ++_purScanPageIdSeq, file, dataUrl: null });
+  await recompressAllPurScanPages();
+}
+
+// ✅ পেজ-সংখ্যা বদলালে (add/remove) সঠিক tier অনুযায়ী সব পেজ আবার
+// কম্প্রেস করা হয় — প্রতিটা page.file (আসল ফাইল) থেকে, আগের সংকুচিত
+// dataUrl থেকে না — নাহলে বারবার কম্প্রেস করলে কোয়ালিটি ক্রমাগত খারাপ হতো।
+async function recompressAllPurScanPages() {
+  if (_purScanRecompressing) return;
+  _purScanRecompressing = true;
+  const box = document.getElementById('pur-scan-pages-box');
+  if (box) box.innerHTML = `<div class="col-span-3 sm:col-span-4 text-center text-xs text-slate-400 py-3"><i class="fa-solid fa-spinner fa-spin mr-1"></i> ছবি প্রসেস হচ্ছে...</div>`;
+
+  try {
+    const tier = getPurScanCompressionTier(_purScanPages.length);
+    for (const page of _purScanPages) {
+      try {
+        page.dataUrl = await compressInvoiceImageFile(page.file, tier);
+      } catch (pageErr) {
+        page.failed = true;
+        page.dataUrl = null;
+        throw pageErr;
+      }
+    }
+  } catch (err) {
+    _purScanPages = _purScanPages.filter(p => !p.failed);
+    const errEl = document.getElementById('pur-scan-error');
+    if (errEl) {
+      errEl.textContent = 'ছবি পুনঃসংকোচন ব্যর্থ হয়েছে। সমস্যা পেজটি সরানো হয়েছে; ফাইলটি আবার সিলেক্ট করুন বা ম্যানুয়াল এন্ট্রি ব্যবহার করুন।';
+      errEl.classList.remove('hidden');
+    }
+  } finally {
+    _purScanRecompressing = false;
+    renderPurScanPagesUI();
+  }
+}
+
+function removePurScanPage(id) {
+  _purScanPages = _purScanPages.filter(p => p.id !== id);
+  recompressAllPurScanPages(); // পেজ কমলে হালকা tier প্রযোজ্য হতে পারে
+}
+
+function movePurScanPage(id, dir) {
+  const idx = _purScanPages.findIndex(p => p.id === id);
+  const newIdx = idx + dir;
+  if (idx === -1 || newIdx < 0 || newIdx >= _purScanPages.length) return;
+  const [item] = _purScanPages.splice(idx, 1);
+  _purScanPages.splice(newIdx, 0, item);
+  renderPurScanPagesUI(); // ✅ শুধু reorder — কম্প্রেশন অপরিবর্তিত থাকে বলে re-compress লাগে না
+}
+
+function renderPurScanPagesUI() {
+  const box = document.getElementById('pur-scan-pages-box');
+  const sizeNote = document.getElementById('pur-scan-size-note');
+  const submitBtn = document.getElementById('pur-scan-submit-btn');
+  if (!box) return;
+
+  if (!_purScanPages.length) {
+    box.innerHTML = `<div class="col-span-3 sm:col-span-4 text-center text-xs text-slate-400 py-4">এখনো কোনো পেজ যোগ করা হয়নি</div>`;
+  } else {
+    box.innerHTML = _purScanPages.map((p, i) => `
+      <div class="relative border border-slate-200 dark:border-slate-600 rounded-lg overflow-hidden bg-white">
+        <img src="${p.dataUrl || ''}" class="w-full h-20 object-cover"/>
+        <span class="absolute top-1 left-1 bg-black/60 text-white text-[10px] font-bold px-1.5 py-0.5 rounded">পেজ ${i + 1}</span>
+        <button type="button" onclick="removePurScanPage(${p.id})" class="absolute top-1 right-1 bg-black/60 hover:bg-red-600 text-white w-5 h-5 rounded-full text-[10px] flex items-center justify-center">
+          <i class="fa-solid fa-xmark"></i>
+        </button>
+        <div class="absolute bottom-1 right-1 flex gap-1">
+          ${i > 0 ? `<button type="button" onclick="movePurScanPage(${p.id},-1)" class="bg-black/60 hover:bg-brand text-white w-5 h-5 rounded text-[10px] flex items-center justify-center"><i class="fa-solid fa-arrow-left"></i></button>` : ''}
+          ${i < _purScanPages.length - 1 ? `<button type="button" onclick="movePurScanPage(${p.id},1)" class="bg-black/60 hover:bg-brand text-white w-5 h-5 rounded text-[10px] flex items-center justify-center"><i class="fa-solid fa-arrow-right"></i></button>` : ''}
+        </div>
+      </div>`).join('');
+  }
+
+  const totalBytes = purScanTotalBytes();
+  const totalMB = (totalBytes / (1024 * 1024)).toFixed(1);
+  const overBudget = totalBytes > PUR_SCAN_TOTAL_BUDGET_BYTES;
+
+  if (sizeNote) {
+    sizeNote.innerHTML = _purScanPages.length
+      ? `<span class="text-[11px] ${overBudget ? 'text-red-500 font-semibold' : 'text-slate-400'}">মোট ${_purScanPages.length} পেজ, আনুমানিক সাইজ: ${totalMB} MB${overBudget ? ' — সীমা ছাড়িয়ে গেছে, কিছু পেজ সরান বা আলাদাভাবে স্ক্যান করুন।' : ''}</span>`
+      : '';
+  }
+
+  if (submitBtn) submitBtn.disabled = !_purScanPages.length || overBudget || _purScanRecompressing;
+}
+
+async function runPurInvoiceScan() {
+  if (!_purScanPages.length) return;
+  const errEl = document.getElementById('pur-scan-error');
+  errEl.classList.add('hidden');
+  const btn = document.getElementById('pur-scan-submit-btn');
+  btn.disabled = true;
+  btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1"></i> ব্রাউজারে OCR চলছে...`;
+
+  try {
+    if (navigator.onLine && typeof callAiTask === 'function') {
+      try {
+        btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1"></i> নিরাপদ AI proxy-তে স্ক্যান হচ্ছে...`;
+        const imagesBase64 = _purScanPages.map(p => p.dataUrl.replace(/^data:image\/[^;]+;base64,/, ''));
+        const result = await callAiTask('purchaseInvoiceReader', { imagesBase64 });
+        const aiItems = result?.data?.items || result?.data?.aiItems || [];
+        if (!Array.isArray(aiItems) || !aiItems.length) throw new Error('AI কোনো পণ্য-লাইন শনাক্ত করেনি।');
+        closePurScanModal();
+        openPurOcrReviewModal(aiItems.map((ai, i) => {
+          const line = computeAiLineData(ai);
+          return {
+            rawText: ai.brand || `AI লাইন ${i + 1}`,
+            brand: ai.brand || '',
+            qty: line.qty,
+            purchasePrice: line.purchasePrice,
+            mrp: ai.mrp || 0,
+            expiryDate: normalizeAiExpiry(ai.expiry_date),
+            batchNumber: ai.batch_no || '',
+            confidence: ai.confidence ? Math.round(ai.confidence) : 75,
+          };
+        }));
+        return;
+      } catch (proxyErr) {
+        console.warn('Invoice proxy scan ব্যর্থ; local OCR fallback:', proxyErr);
+        btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1"></i> লোকাল OCR fallback চলছে...`;
+      }
+    }
+    if (!window.Tesseract) {
+      throw new Error('OCR লাইব্রেরি লোড হয়নি। ইন্টারনেট সংযোগ যাচাই করুন অথবা ম্যানুয়ালি ক্রয় এন্ট্রি করুন।');
+    }
+    const worker = await Tesseract.createWorker('eng+ben', 1, {
+      workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
+      corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
+      langPath: 'https://tessdata.projectnaptha.com/4.0.0',
+      logger: progress => {
+        if (btn && progress.status) {
+          btn.innerHTML = `<i class="fa-solid fa-spinner fa-spin mr-1"></i> ${esc(progress.status)}${progress.progress ? ` ${Math.round(progress.progress * 100)}%` : ''}`;
+        }
+      },
+    });
+    const lines = [];
+    try {
+      for (const page of _purScanPages) {
+        const result = await worker.recognize(page.dataUrl);
+        (result.data.lines || []).forEach(line => {
+          if (String(line.text || '').trim()) lines.push({ text: line.text.trim(), confidence: Number(line.confidence) || 0 });
+        });
+      }
+    } finally {
+      await worker.terminate();
+    }
+    const rows = parsePurOcrLines(lines);
+    if (!rows.length) throw new Error('কোনো সম্ভাব্য পণ্য-লাইন পাওয়া যায়নি। আরও স্পষ্ট ছবি দিন অথবা ম্যানুয়ালি ক্রয় এন্ট্রি করুন।');
+    closePurScanModal();
+    openPurOcrReviewModal(rows);
+  } catch (err) {
+    errEl.textContent = 'AI/OCR ব্যর্থ হয়েছে। আবার চেষ্টা করুন; Tesseract লোড না হলে ইন্টারনেট পুনঃচালু করুন বা পেজ সরান। বিকল্প: “বন্ধ করুন” → ম্যানুয়াল ক্রয় এন্ট্রি করুন।';
+    errEl.classList.remove('hidden');
+  } finally {
+    if (document.getElementById('pur-scan-submit-btn')) {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="fa-solid fa-magnifying-glass mr-1"></i> OCR চালান';
+    }
+  }
+}
+
+function parsePurOcrLines(lines) {
+  return lines
+    .filter(line => /[A-Za-z\u0980-\u09FF]/.test(line.text))
+    .map(line => {
+      const expiryMatch = line.text.match(/\b(0?[1-9]|1[0-2])[\/-](20\d{2})\b/);
+      const expiryDate = expiryMatch ? String(expiryMatch[1]).padStart(2, '0') + '/' + expiryMatch[2] : '';
+      const cleaned = expiryMatch ? line.text.replace(expiryMatch[0], ' ') : line.text;
+      const numericMatches = Array.from(cleaned.matchAll(/(?:^|\s)(\d+(?:[.,]\d{1,2})?)(?=\s|$)/g));
+      const values = numericMatches.map(match => parseFloat(match[1].replace(',', '.')));
+      const removeCount = values.length >= 3 ? 3 : values.length >= 2 ? 2 : 0;
+      const lastNumericStart = removeCount ? numericMatches[numericMatches.length - removeCount].index : -1;
+      const brand = (lastNumericStart >= 0 ? cleaned.slice(0, lastNumericStart) : cleaned)
+        .replace(/[|:;]+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+      return {
+        rawText: line.text,
+        brand: brand || line.text,
+        qty: values.length >= 2 ? values[values.length - removeCount] || '' : '',
+        purchasePrice: values.length >= 2 ? values[values.length - removeCount + 1] || '' : '',
+        mrp: '',
+        expiryDate,
+        batchNumber: '',
+        confidence: Math.max(0, Math.min(100, Math.round(line.confidence))),
+      };
+    })
+    .filter(row => row.brand);
+}
+
+function openPurOcrReviewModal(rows) {
+  document.getElementById('pur-ocr-review-modal')?.remove();
+  const medicines = APP_STATE.medicines || [];
+  const modal = document.createElement('div');
+  modal.id = 'pur-ocr-review-modal';
+  modal.className = 'fixed inset-0 z-[9996] bg-black/60 flex items-center justify-center p-2 sm:p-4';
+  modal.innerHTML = `
+    <div class="bg-white dark:bg-slate-800 rounded-xl p-4 sm:p-6 max-w-6xl w-full max-h-[94vh] overflow-y-auto">
+      <h4 class="font-bold text-slate-800 dark:text-white mb-1"><i class="fa-solid fa-table-list text-brand mr-1"></i> OCR արդյունքի মানব যাচাই</h4>
+      <p class="text-xs text-slate-500 mb-3">OCR-এ ধরা মানগুলো অনুমানমাত্র। ওষুধের নাম, পরিমাণ, ক্রয়দাম, MRP, মেয়াদ ও ব্যাচ মিলিয়ে নিন। এখানে নিশ্চিত করলেও purchase/stock/payable সংরক্ষিত হবে না—পরের ধাপে মূল ক্রয় ফর্মে আলাদা করে “ক্রয় নিশ্চিত করুন” চাপতে হবে।</p>
+      <div class="overflow-x-auto border rounded-lg mb-3">
+        <table class="w-full min-w-[980px] text-xs">
+          <thead class="bg-slate-50 dark:bg-slate-900/50"><tr>
+            <th class="p-2 text-left">পড়া লাইন / ক্যাটালগ-ম্যাচ</th><th class="p-2">পরিমাণ</th><th class="p-2">একক ক্রয়দাম</th><th class="p-2">MRP</th><th class="p-2">মেয়াদ</th><th class="p-2">নিশ্চয়তা</th>
+          </tr></thead>
+          <tbody>${rows.map((row, i) => `
+            <tr class="border-t border-slate-100 dark:border-slate-700" data-ocr-row="${i}">
+              <td class="p-2">
+                <input data-field="brand" list="pur-ocr-meds" value="${esc(row.brand)}" aria-label="পণ্যের নাম ${i + 1}" class="w-full min-w-56 px-2 py-1.5 border rounded bg-white dark:bg-slate-700"/>
+                <div class="text-[10px] text-slate-400 mt-1 truncate max-w-sm" title="${esc(row.rawText)}">OCR: ${esc(row.rawText)}</div>
+              </td>
+              <td class="p-2"><input data-field="qty" type="number" min="1" step="1" value="${esc(row.qty)}" class="w-20 px-2 py-1.5 border rounded bg-white dark:bg-slate-700"/></td>
+              <td class="p-2"><input data-field="purchasePrice" type="number" min="0" step="0.01" value="${esc(row.purchasePrice)}" class="w-24 px-2 py-1.5 border rounded bg-white dark:bg-slate-700"/></td>
+              <td class="p-2"><input data-field="mrp" type="number" min="0" step="0.01" value="${esc(row.mrp)}" class="w-24 px-2 py-1.5 border rounded bg-white dark:bg-slate-700"/></td>
+              <td class="p-2"><input data-field="expiryDate" value="${esc(row.expiryDate)}" placeholder="MM/YYYY" class="w-24 px-2 py-1.5 border rounded bg-white dark:bg-slate-700"/></td>
+              <td class="p-2 whitespace-nowrap ${row.confidence < 65 ? 'text-red-600 font-semibold' : 'text-amber-600'}">${row.confidence}% ${row.confidence < 65 ? '— কম' : '— যাচাই করুন'}
+                <button type="button" onclick="removePurOcrReviewRow(this)" class="block text-red-500 hover:underline mt-1">ভুল লাইন বাদ</button>
+              </td>
+            </tr>`).join('')}</tbody>
+        </table>
+      </div>
+      <datalist id="pur-ocr-meds">${medicines.map(m => `<option value="${esc(`${m.brand} ${m.doseForm || ''} ${m.strength || ''}`.trim())}"></option>`).join('')}</datalist>
+      <label class="flex items-start gap-2 text-xs text-slate-700 dark:text-slate-200 mb-4">
+        <input id="pur-ocr-reviewed" type="checkbox" class="mt-0.5"/>
+        <span>আমি সারণির প্রতিটি সারি যাচাই করেছি; OCR-এর ভুল থাকলে সংশোধন করেছি। এই নিশ্চিতকরণ শুধু মূল ক্রয় ফর্মে তথ্য বসাবে—সংরক্ষণ করবে না।</span>
+      </label>
+      <div id="pur-ocr-review-error" class="hidden text-xs text-red-600 mb-3"></div>
+      <div class="flex flex-col-reverse sm:flex-row gap-2 sm:justify-end">
+        <button onclick="document.getElementById('pur-ocr-review-modal').remove()" class="btn btn-secondary">বাতিল</button>
+        <button id="pur-ocr-apply-btn" onclick="confirmPurOcrReview()" class="btn btn-primary" disabled>যাচাই শেষে ক্রয় ফর্মে বসান</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  openAppModal('pur-ocr-review-modal', () => document.getElementById('pur-ocr-review-modal')?.remove());
+  document.getElementById('pur-ocr-reviewed').addEventListener('change', event => {
+    document.getElementById('pur-ocr-apply-btn').disabled = !event.target.checked;
+  });
+}
+
+function removePurOcrReviewRow(button) {
+  button.closest('[data-ocr-row]')?.remove();
+}
+
+function confirmPurOcrReview() {
+  const modal = document.getElementById('pur-ocr-review-modal');
+  const error = document.getElementById('pur-ocr-review-error');
+  if (!document.getElementById('pur-ocr-reviewed')?.checked) return;
+  const rowElements = Array.from(modal.querySelectorAll('[data-ocr-row]'));
+  if (!rowElements.length) {
+    error.textContent = 'কমপক্ষে একটি যাচাইকৃত পণ্য-সারি রাখতে হবে।';
+    error.classList.remove('hidden');
+    return;
+  }
+  const rows = rowElements.map(row => {
+    const value = field => row.querySelector(`[data-field="${field}"]`).value.trim();
+    return {
+      brand: value('brand'),
+      qty: parseFloat(value('qty')),
+      purchasePrice: parseFloat(value('purchasePrice')),
+      mrp: parseFloat(value('mrp')) || 0,
+      expiryDate: value('expiryDate'),
+    };
+  });
+  if (rows.some(row => !row.brand || !Number.isFinite(row.qty) || row.qty <= 0 ||
+      !Number.isFinite(row.purchasePrice) || row.purchasePrice < 0)) {
+    error.textContent = 'প্রতিটি সারিতে পণ্যের নাম, শূন্যের বেশি পরিমাণ এবং বৈধ ক্রয়দাম দিন।';
+    error.classList.remove('hidden');
+    return;
+  }
+  const isDraftEmpty = APP_STATE.purItems.length === 1 && !APP_STATE.purItems[0].medId && !APP_STATE.purItems[0].aiRawBrand;
+  const reviewedItems = rows.map(row => {
+    const match = APP_STATE.medicines.find(m =>
+      `${m.brand} ${m.doseForm || ''} ${m.strength || ''}`.trim().toLowerCase() === row.brand.toLowerCase() ||
+      m.brand.trim().toLowerCase() === row.brand.toLowerCase()
+    );
+    return {
+      medId: match?.id || '',
+      brand: match?.brand || '',
+      doseForm: match?.doseForm || '',
+      strength: match?.strength || '',
+      qty: row.qty,
+      purchasePrice: row.purchasePrice,
+      mrp: row.mrp,
+      sellPrice: 0,
+      expiryDate: row.expiryDate,
+      batchNumber: '',
+      discountPct: 0,
+      discountAmt: 0,
+      aiRawBrand: match ? '' : row.brand,
+      ocrReviewed: true,
+    };
+  });
+  APP_STATE.purItems = isDraftEmpty ? reviewedItems : APP_STATE.purItems.concat(reviewedItems);
+  APP_STATE.purAiInvoiceTotal = null;
+  modal.remove();
+  renderPurItems();
+  calcPurTotal();
+  toast('মানব-যাচাইকৃত OCR তথ্য ক্রয় ফর্মে বসেছে। সংরক্ষণ করতে আলাদা করে “ক্রয় নিশ্চিত করুন” চাপুন।', 's');
+}
+
+// ✅ AI-প্রাপ্ত brand নাম দিয়ে বিদ্যমান medicine-এ ম্যাচ — AI ডোজ-ফর্ম/শক্তি দেয়
+// না বলে resolveMedicineMatch() reuse না করে আলাদা সরল brand-only matcher।
+// exact-single বা partial-single হলেই auto-select; নাহলে (০ বা ১+ ম্যাচ) খালি
+// রেখে ইউজারকে ম্যানুয়ালি বাছতে দেওয়া হয় — silent-wrong-selection এড়াতে।
+// ✅ নতুন — ব্র্যান্ডের শেষে প্রায়ই প্যাক-সাইজ marker থাকে: "(30s)", "(20s)",
+// "10X10'S" — matching-এর আগে এসব বাদ দেওয়া হয়, নাহলে মাস্টারে থাকা
+// পরিষ্কার ব্র্যান্ড-নামের সাথে মিলবে না।
+function stripPackSizeSuffix(brand) {
+  return String(brand || '')
+    .replace(/\(?\s*\d+\s*[xX×]\s*\d+\s*'?s\)?/gi, '')
+    .replace(/\(?\s*\d+\s*'?s\)?/gi, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+function fuzzyMatchAiBrandToMedicine(aiBrand) {
+  const q = stripPackSizeSuffix(aiBrand).toLowerCase();
+  if (!q) return null;
+  const exact = APP_STATE.medicines.filter(m => m.brand.trim().toLowerCase() === q);
+  if (exact.length === 1) return exact[0];
+  const partial = APP_STATE.medicines.filter(m =>
+    m.brand.toLowerCase().includes(q) || q.includes(m.brand.toLowerCase())
+  );
+  if (partial.length === 1) return partial[0];
+  return null;
+}
+
+// MM/YYYY প্রত্যাশিত, কিন্তু M/YYYY বা MM-YYYY এর মতো সামান্য বিচ্যুতিও হ্যান্ডল করে
+function normalizeAiExpiry(val) {
+  if (!val) return '';
+  const m = String(val).match(/(\d{1,2})[\/\-](\d{4})/);
+  if (!m) return '';
+  return String(m[1]).padStart(2, '0') + '/' + m[2];
+}
+
+// ✅ unit_type (AI-detected packaging category) বনাম medicine master-এর doseForm —
+// mismatch হলে silent-trust না করে flag করা হয় (patient-safety/data-integrity philosophy-এর
+// সম্প্রসারণ, ঠিক resolveMedicineMatch()-এর disambiguation-এর মতোই)। "pot" ইচ্ছাকৃতভাবে
+// বাদ — এটা আলগা ট্যাবলেট/পাউডার দুটোই হতে পারে, doseForm-এর সাথে নির্দিষ্টভাবে মেলে না।
+const UNIT_TYPE_DOSEFORM_MAP = {
+  piece: ['ট্যাবলেট', 'ক্যাপসুল', 'সাপোজিটরি'],
+  bottle: ['সিরাপ', 'ড্রপস', 'ইনজেকশন', 'ইনহেলার'],
+  tube: ['ক্রিম/মলম'],
+};
+
+function checkDoseFormMismatch(unitType, doseForm) {
+  const allowed = UNIT_TYPE_DOSEFORM_MAP[unitType];
+  if (!allowed) return false; // "pot" বা অজানা unit_type — validation skip
+  return !allowed.includes(doseForm);
+}
+
+// VAT-সহ সরাসরি প্রতি ইউনিটের মূল্য ও লাইনের মোট হিসাব।
+const AI_LINE_TOLERANCE = 0.05; // ৳ — শুধু রাউন্ডিং-জনিত সামান্য পার্থক্য মেনে নেওয়ার জন্য
+
+function computeAiLineData(ai) {
+  const qty = Math.max(0, parseFloat(ai.invoiced_qty) || 0);
+  const unitTp = ai.unit_tp !== null && ai.unit_tp !== undefined ? parseFloat(ai.unit_tp) || 0 : 0;
+  const unitVat = ai.unit_vat !== null && ai.unit_vat !== undefined ? parseFloat(ai.unit_vat) || 0 : 0;
+  const purchasePrice = round2(unitTp + unitVat);
+  const lineTotalComputed = round2(qty * purchasePrice);
+
+  const printed = ai.line_total_printed !== null && ai.line_total_printed !== undefined
+    ? parseFloat(ai.line_total_printed) : null;
+
+  let priceStatus; // 'verified' | 'mismatch' | 'unverifiable'
+  if (printed === null || isNaN(printed)) priceStatus = 'unverifiable';
+  else priceStatus = Math.abs(lineTotalComputed - printed) <= AI_LINE_TOLERANCE ? 'verified' : 'mismatch';
+
+  return {
+    qty, purchasePrice,
+    lineTotalComputed, lineTotalPrinted: printed, priceStatus,
+  };
+}
+
+function applyAiScannedItemsToPurchaseForm(aiItems, invoiceTotal) {
+  closeMedDisambiguation();
+  const newRows = aiItems.map(ai => {
+    const matched = fuzzyMatchAiBrandToMedicine(ai.brand);
+    const lineData = computeAiLineData(ai);
+    const mrp = Math.max(0, parseFloat(ai.mrp) || 0);
+    const expiryDate = normalizeAiExpiry(ai.expiry_date);
+    const unitType = ai.unit_type || '';
+    const doseFormMismatch = matched ? checkDoseFormMismatch(unitType, matched.doseForm) : false;
+
+    const common = {
+      qty: lineData.qty, purchasePrice: lineData.purchasePrice, mrp, expiryDate,
+      discountPct: 0, discountAmt: 0, // ✅ নতুন — AI-স্ক্যান করা আইটেমেও ছাড়-ফিল্ড আছে, ডিফল্ট শূন্য
+      aiScanned: true,
+      aiPriceStatus: lineData.priceStatus, aiLineTotalPrinted: lineData.lineTotalPrinted,
+      aiUnitType: unitType, aiDoseFormMismatch: doseFormMismatch, aiBatchNo: ai.batch_no || '',
+    };
+
+    if (matched) {
+      const inv = APP_STATE.inventory.find(x => x.medId === matched.id);
+      return {
+        ...common,
+        medId: matched.id, brand: matched.brand, doseForm: matched.doseForm, strength: matched.strength,
+        sellPrice: inv?.sellPrice || 0,
+        aiMatched: true, aiRawBrand: ai.brand || '',
+      };
+    }
+    return {
+      ...common,
+      medId: '', brand: '', doseForm: '', strength: '', sellPrice: 0,
+      aiMatched: false, aiRawBrand: ai.brand || '(নাম পড়া যায়নি)',
+    };
+  });
+
+  const isDraftEmpty = APP_STATE.purItems.length === 1 && !APP_STATE.purItems[0].medId && !APP_STATE.purItems[0].aiScanned;
+  APP_STATE.purItems = isDraftEmpty ? newRows : APP_STATE.purItems.concat(newRows);
+  APP_STATE.purAiInvoiceTotal = invoiceTotal !== null && invoiceTotal !== undefined ? parseFloat(invoiceTotal) : null;
+  renderPurItems();
+  calcPurTotal();
+}
+
+// ✅ ইনভয়েসের ছাপা grand total বনাম ফর্মে-থাকা আইটেমগুলোর যোগফল — item-সংখ্যা
+// অনুযায়ী স্কেলিং-tolerance (প্রতি লাইনে সামান্য রাউন্ডিং জমতে পারে)
+function renderAiReconciliationBanner(formTotal) {
+  const box = document.getElementById('pur-ai-reconcile-box');
+  if (!box) return;
+  const expected = APP_STATE.purAiInvoiceTotal;
+  if (expected === null || expected === undefined || isNaN(expected)) { box.innerHTML = ''; return; }
+
+  const aiItemCount = APP_STATE.purItems.filter(i => i.aiScanned).length || 1;
+  const tolerance = Math.max(AI_LINE_TOLERANCE, AI_LINE_TOLERANCE * aiItemCount);
+  const diff = round2(formTotal - expected);
+  const matched = Math.abs(diff) <= tolerance;
+
+  box.innerHTML = matched
+    ? `<div class="bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-200 dark:border-emerald-800 text-emerald-700 dark:text-emerald-400 text-xs rounded-lg px-3 py-2 mb-3">
+        <i class="fa-solid fa-circle-check mr-1"></i> AI-স্ক্যান করা মোট ইনভয়েসের ছাপা টোটাল (৳${fmt(expected)})-এর সাথে মিলছে।
+      </div>`
+    : `<div class="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-400 text-xs rounded-lg px-3 py-2 mb-3">
+        <i class="fa-solid fa-triangle-exclamation mr-1"></i> অমিল! ফর্মের মোট ৳${fmt(formTotal)}, কিন্তু ইনভয়েসে ছাপা মোট ৳${fmt(expected)} — পার্থক্য ৳${fmt(Math.abs(diff))}। সাবমিট করার আগে "⚠️" ব্যাজ-যুক্ত লাইনগুলো যাচাই করুন।
+      </div>`;
+}
+
+// ════════════════════════════════════════════════════════════
+// ✅ নতুন — QUICK-ADD MEDICINE FROM PURCHASE ROW
+// ইনভয়েসে পাওয়া গেছে কিন্তু ওষুধ মাস্টারে নেই এমন আইটেম দ্রুত যোগ করে
+// সরাসরি এই purchase-row-এই বসিয়ে দেয় — AI-এর বসানো qty/price/mrp/
+// expiry/discount কিছুই হারায় না (শুধু medId/brand/doseForm/strength
+// টার্গেটেডভাবে সেট করা হয়, applyMedicineToPurItem()-এর মতো পুরো row
+// রিসেট করা হয় না)।
+// ════════════════════════════════════════════════════════════
+let _purQaGmSearchTimer = null;
+let _purQaGmSearchToken = 0;
+let _purQaGmLastResults = [];
+
+function openQuickAddMedicineFromPurchase(i) {
+  if (guardReadOnly()) return;
+  const item = APP_STATE.purItems[i];
+  if (!item) return;
+
+  const prefillBrand = item.aiRawBrand
+    ? stripPackSizeSuffix(normalizeBrandText(item.aiRawBrand))
+    : normalizeBrandText(document.getElementById(`pur-med-input-${i}`)?.value || '');
+  const doseForms = ['ট্যাবলেট', 'ক্যাপসুল', 'সিরাপ', 'ইনজেকশন', 'ক্রিম/মলম', 'ড্রপস', 'ইনহেলার', 'সাপোজিটরি', 'অন্যান্য'];
+  const unitTypeGuessMap = { piece: 'ট্যাবলেট', bottle: 'সিরাপ', tube: 'ক্রিম/মলম' };
+  const guessedForm = unitTypeGuessMap[item.aiUnitType] || 'ট্যাবলেট';
+
+  document.getElementById('pur-quickadd-modal')?.remove();
+  const modal = document.createElement('div');
+  modal.id = 'pur-quickadd-modal';
+  modal.className = 'fixed inset-0 z-[9996] bg-black/50 flex items-center justify-center p-4';
+  modal.innerHTML = `
+    <div class="bg-white dark:bg-slate-800 rounded-xl p-6 max-w-md w-full max-h-[90vh] overflow-y-auto">
+      <h4 class="font-bold text-slate-800 dark:text-white mb-1"><i class="fa-solid fa-plus text-brand mr-1"></i> নতুন ওষুধ (দ্রুত যোগ)</h4>
+      <p class="text-xs text-slate-400 mb-4">এখানে যোগ করলে সরাসরি এই ক্রয়-লাইনেই বসে যাবে — qty/দাম/মেয়াদ/ছাড় যা এখানে বসানো আছে তা অক্ষত থাকবে।</p>
+      <div id="pur-qa-error" class="hidden bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 text-xs rounded-lg px-3 py-2 mb-3"></div>
+
+      <div class="mb-3">
+        <label class="block text-xs font-semibold text-slate-500 uppercase mb-1"><i class="fa-solid fa-cloud-arrow-down text-brand mr-1"></i>গ্লোবাল মাস্টার থেকে খুঁজুন (ঐচ্ছিক)</label>
+        <input type="text" id="pur-qa-gm-search-input" placeholder="ব্র্যান্ড নাম টাইপ করুন..." oninput="onPurQaGlobalMedSearch(this.value)"
+          class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+        <div id="pur-qa-gm-search-results" class="max-h-32 overflow-y-auto mt-1"></div>
+        <p class="text-[10px] text-slate-400 mt-1">নির্বাচন করলে জেনেরিক/ক্যাটাগরি/ম্যানুফ্যাকচারার নিচে অটো-ফিল হবে।</p>
+      </div>
+
+      <div class="space-y-3 mb-4 pt-3 border-t border-slate-100 dark:border-slate-700">
+        <div>
+          <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">Brand Name (English) *</label>
+          <input type="text" id="pur-qa-brand" value="${esc(prefillBrand)}" placeholder="e.g. Maxpro"
+            class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">ডোজ ফর্ম *</label>
+            <select id="pur-qa-doseform" class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white">
+              ${doseForms.map(d => `<option value="${esc(d)}" ${d === guessedForm ? 'selected' : ''}>${esc(d)}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">শক্তি/পরিমাণ *</label>
+            <input type="text" id="pur-qa-strength" placeholder="20mg বা 100ml"
+              class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">জেনেরিক নাম</label>
+          <input type="text" id="pur-qa-generic" placeholder="ঐচ্ছিক — গ্লোবাল সার্চ থেকে অটো-ফিল হতে পারে"
+            class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">ক্যাটাগরি</label>
+            <input type="text" id="pur-qa-category" placeholder="ঐচ্ছিক"
+              class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+          </div>
+          <div>
+            <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">ম্যানুফ্যাকচারার</label>
+            <input type="text" id="pur-qa-manufacturer" placeholder="ঐচ্ছিক"
+              class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+          </div>
+        </div>
+        <div>
+          <label class="block text-xs font-semibold text-slate-500 uppercase mb-1">রি-অর্ডার লেভেল</label>
+          <input type="number" id="pur-qa-reorder" value="10" min="0"
+            class="w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-800 dark:text-white"/>
+        </div>
+      </div>
+      <div class="flex gap-2">
+        <button id="pur-qa-save-btn" onclick="submitQuickAddMedicine(${i})" class="btn btn-primary flex-1">যোগ করে বসান</button>
+        <button onclick="document.getElementById('pur-quickadd-modal').remove()" class="btn btn-secondary">বাতিল</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+  openAppModal('pur-quickadd-modal', () => document.getElementById('pur-quickadd-modal')?.remove());
+  document.getElementById('pur-qa-brand').focus();
+}
+
+function onPurQaGlobalMedSearch(val) {
+  clearTimeout(_purQaGmSearchTimer);
+  const myToken = ++_purQaGmSearchToken;
+
+  _purQaGmSearchTimer = setTimeout(async () => {
+    const box = document.getElementById('pur-qa-gm-search-results');
+    if (!box) return;
+    if (val.trim().length < 2) { if (myToken === _purQaGmSearchToken) box.innerHTML = ''; return; }
+
+    if (myToken !== _purQaGmSearchToken) return;
+    box.innerHTML = '<div class="text-center text-xs text-slate-400 py-2"><i class="fa-solid fa-spinner fa-spin"></i></div>';
+
+    const res = await apiSearchGlobalMedicines(val);
+    if (myToken !== _purQaGmSearchToken) return;
+
+    if (!res.success || !res.results.length) {
+      box.innerHTML = '<div class="text-center text-xs text-slate-400 py-2">পাওয়া যায়নি</div>';
+      return;
+    }
+
+    _purQaGmLastResults = res.results;
+    box.innerHTML = res.results.map((m, idx) => `
+      <div class="flex justify-between items-center py-1.5 px-2 border-b border-slate-100 dark:border-slate-700/50 hover:bg-slate-50 dark:hover:bg-slate-700/40 cursor-pointer" data-idx="${idx}">
+        <div class="min-w-0"><div class="text-xs font-semibold truncate">${esc(m.brand)}</div><div class="text-[10px] text-slate-400 truncate">${esc(m.generic || '')} • ${esc(m.manufacturer || '')}</div></div>
+        <i class="fa-solid fa-arrow-turn-down-left text-slate-300 text-xs flex-shrink-0"></i>
+      </div>`).join('');
+
+    box.querySelectorAll('[data-idx]').forEach(row => {
+      row.addEventListener('click', () => {
+        const m = _purQaGmLastResults[parseInt(row.dataset.idx, 10)];
+        if (!m) return;
+        const genEl = document.getElementById('pur-qa-generic');
+        const catEl = document.getElementById('pur-qa-category');
+        const mfrEl = document.getElementById('pur-qa-manufacturer');
+        if (genEl && !genEl.value) genEl.value = m.generic || '';
+        if (catEl && !catEl.value) catEl.value = m.category || '';
+        if (mfrEl && !mfrEl.value) mfrEl.value = m.manufacturer || '';
+        toast(`"${m.brand}" থেকে জেনেরিক/ক্যাটাগরি/ম্যানুফ্যাকচারার প্রি-ফিল হয়েছে।`, 's');
+        box.innerHTML = '';
+        document.getElementById('pur-qa-gm-search-input').value = '';
+      });
+    });
+  }, 350);
+}
+
+async function submitQuickAddMedicine(i) {
+  const errEl = document.getElementById('pur-qa-error');
+  const showErr = (msg) => { errEl.textContent = msg; errEl.classList.remove('hidden'); };
+  errEl.classList.add('hidden');
+
+  const brand = normalizeBrandText(document.getElementById('pur-qa-brand').value);
+  const doseForm = document.getElementById('pur-qa-doseform').value;
+  const strength = document.getElementById('pur-qa-strength').value.trim();
+  const generic = document.getElementById('pur-qa-generic').value.trim();
+  const category = document.getElementById('pur-qa-category').value.trim();
+  const manufacturer = document.getElementById('pur-qa-manufacturer').value.trim();
+  const reorderLevel = parseInt(document.getElementById('pur-qa-reorder').value) || 10;
+
+  if (!brand) return showErr('Brand Name আবশ্যক।');
+  if (!isEnglishBrand(brand)) return showErr('Brand Name অবশ্যই ইংরেজি অক্ষরে লিখতে হবে।');
+  if (!strength) return showErr('শক্তি/পরিমাণ আবশ্যক।');
+
+  const dup = findDuplicateMedicine(brand, doseForm, strength, null);
+  if (dup) return showErr(`এই ওষুধ ইতিমধ্যে আছে (${dup.id}) — সার্চ-বক্সে টাইপ করে সরাসরি নির্বাচন করুন।`);
+
+  const btn = document.getElementById('pur-qa-save-btn');
+  btn.disabled = true;
+  btn.textContent = 'যোগ হচ্ছে...';
+
+  try {
+    const id = genMedicineId(brand);
+    const res = await apiAddMedicine({ id, brand, generic, doseForm, strength, manufacturer, category, unit: 'পাতা', reorderLevel });
+    if (!res.success) { showErr(res.message); btn.disabled = false; btn.textContent = 'যোগ করে বসান'; return; }
+
+    if (res.queued) {
+      toast(res.message, 'w');
+      refreshSyncBadge();
+      document.getElementById('pur-quickadd-modal')?.remove();
+      toast('অফলাইনে যোগ হয়েছে — সিঙ্ক শেষ হলে সার্চ করে ম্যানুয়ালি এই লাইনে বসান।', 'w');
+      return;
+    }
+
+    const newMed = { id, brand, generic, doseForm, strength, manufacturer, category, unit: 'পাতা', reorderLevel };
+    const invRow = { medId: id, brand, doseForm, strength, totalStock: 0, costValue: 0, mrpValue: 0, sellPrice: 0, nearestExpiry: '', status: 'out', batches: [] };
+    APP_STATE.medicines.push(newMed);
+    APP_STATE.inventory.push(invRow);
+
+    // ✅ টার্গেটেড আপডেট — qty/purchasePrice/mrp/expiry/discount অক্ষত থাকছে
+    const item = APP_STATE.purItems[i];
+    item.medId = id;
+    item.brand = brand;
+    item.doseForm = doseForm;
+    item.strength = strength;
+    if (item.aiScanned) { item.aiMatched = true; }
+
+    renderPurItems();
+    calcPurTotal(); // ✅ ফিক্স — আগে কল করা হতো না, তাই quick-add-এর পরে টোটাল/effective-discount stale থাকত
+    toast(`"${brand}" ওষুধ মাস্টারে যোগ হয়েছে এবং এই লাইনে বসানো হয়েছে।`, 's');
+    document.getElementById('pur-quickadd-modal')?.remove();
+  } catch (err) {
+    showErr(humanizeError(err));
+    btn.disabled = false;
+    btn.textContent = 'যোগ করে বসান';
+  }
+}
+
+// ════════════════════════════════════════════════════════════
+// ✅ PURCHASE CART/DRAFT — POS-এর একই প্যাটার্ন। AI-স্ক্যান করা
+// আংশিক-যাচাই করা আইটেমও এভাবে সংরক্ষণ করা যায় (aiScanned/aiRawBrand
+// ফিল্ডসহ পুরো purItems serialize হয়)।
+// ⚠️ AI-reconciliation ব্যানারের APP_STATE.purAiInvoiceTotal ড্রাফটে
+// সংরক্ষিত হয় না (ইচ্ছাকৃত — সেটা সেই নির্দিষ্ট স্ক্যান-সেশনের জন্য,
+// ড্রাফট রিলোডে অর্থহীন হয়ে যায়)।
+// ════════════════════════════════════════════════════════════
+function capturePurchaseDraftState() {
+  return {
+    purItems: JSON.parse(JSON.stringify(APP_STATE.purItems || [])),
+    purSupplierId: APP_STATE.purSupplierId || null,
+    purDate: document.getElementById('pur-date')?.value || APP_STATE.purDate,
+    purPayType: APP_STATE.purPayType || 'নগদ',
+    purGrossDiscPct: APP_STATE.purGrossDiscPct || 0,
+  };
+}
+
+function savePurchaseCartAsDraft() {
+  const hasItems = (APP_STATE.purItems || []).some(i => i.medId);
+  if (!hasItems) { toast('ক্রয়-ফর্মে কোনো ওষুধ নেই — সংরক্ষণ করার কিছু নেই।', 'w'); return; }
+
+  const supId = APP_STATE.purSupplierId;
+  const supName = supId ? (APP_STATE.suppliers.find(s => s.id === supId)?.name || supId) : 'সরবরাহকারী নির্বাচিত নয়';
+  const itemCount = APP_STATE.purItems.filter(i => i.medId).length;
+
+  addDraft('purchase', `${supName} — ${itemCount} আইটেম`, capturePurchaseDraftState());
+  toast('ক্রয়-খসড়া সংরক্ষিত হয়েছে — এখন নতুন ক্রয় শুরু করতে পারেন।', 's');
+  resetPurchase();
+  renderPurchaseDraftBadge();
+}
+
+function renderPurchaseDraftBadge() {
+  const el = document.getElementById('purchase-drafts-count');
+  if (el) el.textContent = `ড্রাফট (${getDraftCount('purchase')})`;
+}
+
+function openPurchaseDraftsModal() {
+  document.getElementById('purchase-drafts-modal')?.remove();
+  const modal = document.createElement('div');
+  modal.id = 'purchase-drafts-modal';
+  modal.className = 'fixed inset-0 z-[9995] bg-black/50 flex items-center justify-center p-4';
+  modal.innerHTML = `
+    <div class="bg-white dark:bg-slate-800 rounded-xl p-6 max-w-md w-full max-h-[80vh] overflow-y-auto">
+      <h4 class="font-bold text-slate-800 dark:text-white mb-1"><i class="fa-solid fa-layer-group text-brand mr-1"></i> সংরক্ষিত ক্রয়-খসড়া</h4>
+      <p class="text-xs text-slate-400 mb-4">শুধু এই ডিভাইসে সংরক্ষিত থাকে — অন্য ডিভাইস/ব্রাউজারে দেখা যাবে না।</p>
+      <div id="purchase-drafts-list" class="space-y-2 mb-4"></div>
+      <button onclick="document.getElementById('purchase-drafts-modal').remove()" class="btn btn-secondary btn-block">বন্ধ করুন</button>
+    </div>`;
+  document.body.appendChild(modal);
+  openAppModal('purchase-drafts-modal', () => document.getElementById('purchase-drafts-modal')?.remove());
+  renderPurchaseDraftsList(getDrafts('purchase'));
+}
+
+function renderPurchaseDraftsList(drafts) {
+  const box = document.getElementById('purchase-drafts-list');
+  if (!box) return;
+  if (!drafts.length) {
+    box.innerHTML = `<div class="text-center text-slate-400 text-sm py-6">কোনো সংরক্ষিত খসড়া নেই।</div>`;
+    return;
+  }
+  box.innerHTML = drafts.map(d => `
+    <div class="flex items-center justify-between gap-2 border border-slate-200 dark:border-slate-600 rounded-lg px-3 py-2">
+      <div class="min-w-0">
+        <div class="text-sm font-semibold text-slate-800 dark:text-white truncate">${esc(d.label)}</div>
+        <div class="text-[11px] text-slate-400">${esc(formatRelativeTime(d.savedAt))}</div>
+      </div>
+      <div class="flex items-center gap-3 flex-shrink-0">
+        <button onclick="loadPurchaseDraft('${d.id}')" class="text-brand text-xs font-semibold hover:underline">লোড করুন</button>
+        <button onclick="deletePurchaseDraftConfirm('${d.id}')" class="text-red-400 hover:text-red-600"><i class="fa-solid fa-trash text-xs"></i></button>
+      </div>
+    </div>`).join('');
+}
+
+function loadPurchaseDraft(draftId) {
+  const draft = getDrafts('purchase').find(d => d.id === draftId);
+  if (!draft) return;
+
+  const hasCurrentItems = (APP_STATE.purItems || []).some(i => i.medId);
+  if (hasCurrentItems && !confirm('বর্তমান ক্রয়-ফর্মে অসংরক্ষিত আইটেম আছে — ড্রাফট লোড করলে এগুলো হারিয়ে যাবে। চালিয়ে যাবেন? (চাইলে আগে "খসড়া সংরক্ষণ করুন" চেপে নিজে সেভ করে নিন)')) return;
+
+  removeDraft('purchase', draftId);
+  APP_STATE.purItems = draft.state.purItems || [];
+  APP_STATE.purSupplierId = draft.state.purSupplierId || null;
+  APP_STATE.purDate = draft.state.purDate || null;
+  APP_STATE.purPayType = draft.state.purPayType || 'নগদ';
+  APP_STATE.purGrossDiscPct = draft.state.purGrossDiscPct || 0;
+  APP_STATE.purAiInvoiceTotal = null;
+
+  document.getElementById('purchase-drafts-modal')?.remove();
+  renderPurchaseModule();
+  toast('ড্রাফট লোড হয়েছে।', 's');
+}
+
+function deletePurchaseDraftConfirm(draftId) {
+  if (!confirm('এই সংরক্ষিত খসড়া মুছে ফেলতে চান?')) return;
+  removeDraft('purchase', draftId);
+  renderPurchaseDraftsList(getDrafts('purchase'));
+  renderPurchaseDraftBadge();
+}

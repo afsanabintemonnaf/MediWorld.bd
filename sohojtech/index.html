@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="bn" dir="ltr" class="">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+<title>MediWorld BD — PWA</title>
+
+<!-- ═══ GLOBAL ERROR CATCHER (Debug Mode — F12 ছাড়াই এরর দেখার জন্য) ═══ -->
+<script>
+  window.addEventListener('error', function (e) {
+    // Cross-origin script error (যেমন Tailwind CDN) — কোনো useful info নেই, উপেক্ষা করা হচ্ছে
+    if (e.message === 'Script error.' && e.lineno === 0) {
+      console.warn('Cross-origin script error ignored (no details available from browser).');
+      return;
+    }
+    showFatalError(e.message + '\n📍 ফাইল: ' + (e.filename ? e.filename.split('/').pop() : '?') + ' | লাইন: ' + e.lineno);
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    showFatalError('Promise Error: ' + (e.reason?.message || e.reason));
+  });
+  function showFatalError(msg, err) {
+  let banner = document.getElementById('fatal-error-banner');
+  if (!banner) {
+    banner = document.createElement('div');
+    banner.id = 'fatal-error-banner';
+    banner.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:99999;background:#7f1d1d;color:#fff;padding:14px 18px;font-family:sans-serif;font-size:13px;white-space:pre-wrap;max-height:40vh;overflow-y:auto;box-shadow:0 4px 12px rgba(0,0,0,.4)';
+    document.body.appendChild(banner);
+  }
+  const escMsg = String(msg).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  const rawDetail = err ? ((err.code ? '[' + err.code + '] ' : '') + (err.message || String(err))) : '';
+
+  banner.innerHTML = '❌ ' + escMsg + (rawDetail ? `
+    <div style="margin-top:8px">
+      <span id="fatal-detail-toggle" style="cursor:pointer;text-decoration:underline;font-size:11px;opacity:.75">টেকনিক্যাল বিস্তারিত দেখুন</span>
+      <div id="fatal-detail-body" style="display:none;font-family:monospace;font-size:11px;opacity:.85;white-space:pre-wrap;margin-top:6px"></div>
+    </div>` : '');
+
+  if (rawDetail) {
+    document.getElementById('fatal-detail-body').textContent = rawDetail;
+    document.getElementById('fatal-detail-toggle').onclick = () => {
+      const body = document.getElementById('fatal-detail-body');
+      body.style.display = body.style.display === 'none' ? 'block' : 'none';
+    };
+  }
+}
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<!-- Tailwind CDN (shared config — js/tailwind-config.js single source of truth) -->
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="js/tailwind-config.js?v=20260725"></script>
+
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet"/>
+<link rel="stylesheet" href="css/styles.css?v=20261120"/>
+
+<!-- Firebase SDK (compat — script-tag, no build step) -->
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="assets/icons/icon-192.png">
+<link rel="apple-touch-icon" href="assets/icons/icon-192.png">
+<meta name="theme-color" content="#0D1B2A"/>
+</head>
+
+<body class="bg-slate-100 dark:bg-slate-900 text-slate-800 dark:text-slate-100 font-sans min-h-screen transition-colors duration-200">
+
+<!-- ══ LOADING SCREEN ══ -->
+<div id="app-loading" class="fixed inset-0 z-[9999] flex flex-col items-center justify-center
+     bg-gradient-to-br from-slate-900 via-blue-950 to-blue-800 transition-opacity duration-500">
+  <div class="boot-logo w-20 h-20 rounded-2xl bg-white/10 border-2 border-white/20 flex items-center justify-center mb-6">
+    <i class="fa-solid fa-pills text-3xl text-white"></i>
+  </div>
+  <h1 class="boot-title text-2xl font-extrabold text-white tracking-tight mb-1">MediWorld BD</h1>
+  <p class="boot-subtitle text-sm text-white/50 mb-8">Progressive Web App</p>
+  <div class="boot-spinner-group flex flex-col items-center">
+    <div class="w-10 h-10 border-4 border-white/20 border-t-white rounded-full animate-spin mb-4"></div>
+    <p id="loading-message" class="text-xs font-mono text-white/40">Initializing application shell...</p>
+  </div>
+</div>
+
+<!-- ══ LOGIN SCREEN ══ -->
+<div id="screen-login" class="hidden fixed inset-0 z-[9998] flex flex-col items-center justify-center
+     bg-gradient-to-br from-slate-900 via-blue-950 to-blue-800 p-6">
+  <div class="w-20 h-20 rounded-2xl bg-white/10 border-2 border-white/20 flex items-center justify-center mb-6">
+    <i class="fa-solid fa-pills text-3xl text-white"></i>
+  </div>
+  <h1 class="text-2xl font-extrabold text-white tracking-tight mb-1">MediWorld BD</h1>
+  <p class="text-sm text-white/50 mb-8">চালিয়ে যেতে Google দিয়ে লগইন করুন</p>
+  <button onclick="signInWithGoogle()"
+    class="bg-white hover:bg-slate-100 text-slate-800 font-semibold px-6 py-3 rounded-xl
+           flex items-center gap-3 shadow-lg transition">
+    <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" class="w-5 h-5"/>
+    Google দিয়ে লগইন করুন
+  </button>
+  <p class="text-[11px] text-white/30 mt-8 text-center">
+    লগইন করার মাধ্যমে আপনি <a href="terms.html" target="_blank" class="underline hover:text-white/60">ব্যবহারের শর্তাবলী</a>
+    ও <a href="privacy.html" target="_blank" class="underline hover:text-white/60">গোপনীয়তা নীতি</a>-তে সম্মত হচ্ছেন
+  </p>
+</div>
+
+<!-- ══ ACCESS DENIED SCREEN ══ -->
+<div id="screen-access-denied" class="hidden fixed inset-0 z-[9998] flex flex-col items-center justify-center
+     bg-gradient-to-br from-slate-900 via-red-950 to-red-900 p-6 text-center">
+  <div class="w-20 h-20 rounded-2xl bg-red-500/20 border-2 border-red-400/30 flex items-center justify-center mb-6">
+    <i class="fa-solid fa-ban text-3xl text-red-300"></i>
+  </div>
+  <h1 class="text-xl font-bold text-white mb-2">অনুমোদিত অ্যাক্সেস নেই</h1>
+  <p class="text-sm text-white/50 max-w-xs mb-8">Google login যথেষ্ট নয়। Owner/Staff binding এবং branch assignment থাকতে হবে।</p>
+  <button onclick="signOutUser()" class="text-white/60 hover:text-white text-sm underline">লগআউট করুন</button>
+</div>
+
+<!-- ══ APP ROOT ══ -->
+<div id="app-root" class="hidden">
+
+  <!-- Mobile sidebar overlay -->
+  <div id="sidebar-overlay" class="fixed inset-0 bg-black/40 z-30 hidden lg:hidden"></div>
+
+  <!-- ══ SIDEBAR ══ -->
+  <aside id="sidebar"
+    class="fixed top-0 left-0 bottom-0 w-64 bg-[#0D1B2A] z-40 -translate-x-full lg:translate-x-0
+           transition-transform duration-300 flex flex-col overflow-y-auto">
+    <div class="flex items-center gap-3 px-5 py-5 border-b border-white/10">
+      <div class="w-10 h-10 rounded-xl bg-brand flex items-center justify-center flex-shrink-0">
+        <i class="fa-solid fa-pills text-white"></i>
+      </div>
+      <div class="min-w-0">
+        <div class="text-white font-bold text-sm leading-tight">সহজটেক / SohojTech</div>
+        <div id="sidebar-pharma-name" class="text-white/40 text-xs truncate">লোড হচ্ছে...</div>
+      </div>
+    </div>
+
+    <nav id="sidebar-nav" class="flex-1 px-2 py-4 space-y-5"></nav>
+
+    <div class="px-5 py-4 border-t border-white/10">
+      <p class="text-[11px] text-white/25">সহজটেক / SohojTech PWA v5.0 &copy; 2026</p>
+    </div>
+  </aside>
+
+  <!-- ══ HEADER ══ -->
+  <header id="app-header" class="fixed top-0 left-0 lg:left-64 right-0 h-16 bg-white dark:bg-slate-800
+                  border-b border-slate-200 dark:border-slate-700 z-20 flex items-center
+                  justify-between px-4 lg:px-6">
+    <div class="flex items-center gap-3 min-w-0">
+      <button id="hamburger-btn" class="lg:hidden text-slate-600 dark:text-slate-300 w-11 h-11 flex items-center justify-center -ml-2">
+        <i class="fa-solid fa-bars text-lg"></i>
+      </button>
+      <h2 id="header-title" class="font-semibold text-slate-800 dark:text-white truncate">ড্যাশবোর্ড</h2>
+      <select id="active-branch-selector" onchange="changeActiveBranch(this.value)"
+        class="max-w-32 sm:max-w-44 px-2 py-1 text-xs border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-700 dark:text-slate-200"
+        aria-label="সক্রিয় Branch"></select>
+    </div>
+    <div class="flex items-center gap-2 flex-shrink-0">
+      <span id="conn-status-badge"
+        class="hidden sm:inline-flex items-center gap-1.5 bg-emerald-50 dark:bg-emerald-900/30
+               text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800
+               rounded-full px-3 py-1 text-xs font-semibold">
+        <i class="fa-solid fa-circle text-[6px]"></i> সংযুক্ত
+      </span>
+      <button id="header-home-btn" onclick="goHome()" class="btn-icon" title="ড্যাশবোর্ডে ফিরুন" aria-label="ড্যাশবোর্ডে ফিরুন">
+        <i class="fa-solid fa-house"></i>
+      </button>
+      <button id="header-short-list-btn" onclick="goTab('shortList')" class="btn-icon hidden" title="শর্ট লিস্ট" aria-label="শর্ট লিস্ট">
+        <i class="fa-solid fa-list-check"></i>
+      </button>
+      <button onclick="toggleCalculator()" class="btn-icon">
+        <i class="fa-solid fa-calculator"></i>
+      </button>
+      <button id="notification-btn" onclick="openNotifications()" class="btn-icon relative" title="আর্থিক নোটিফিকেশন">
+        <i class="fa-solid fa-bell"></i>
+        <span id="notification-badge" class="hidden absolute -top-1 -right-1 min-w-4 h-4 px-1 rounded-full bg-red-500 text-white text-[9px] leading-4 text-center">0</span>
+      </button>
+      <button id="dark-toggle-btn" class="btn-icon">
+        <i id="dark-toggle-icon" class="fa-solid fa-moon"></i>
+      </button>
+      <div id="user-badge" class="flex items-center gap-2 pl-1"></div>
+      <button onclick="signOutUser()" title="লগআউট" class="btn-icon btn-icon-danger">
+        <i class="fa-solid fa-right-from-bracket text-sm"></i>
+      </button>
+    </div>
+  </header>
+
+  <!-- ══ MAIN CONTENT ══ -->
+  <main id="app-main" class="lg:pl-64 pt-16 min-h-screen">
+    <div class="p-4 lg:p-6" id="tab-panels"></div>
+  </main>
+
+</div>
+
+<!-- ══ TOAST CONTAINER ══ -->
+<div id="toast-container" class="fixed bottom-6 right-6 z-[9990] flex flex-col gap-2"></div>
+
+<script src="js/config.js?v=20260805"></script>
+<script src="js/utils.js?v=20260816"></script>
+<script src="js/state.js?v=20260805"></script>
+<script src="js/ui-components.js?v=20260805"></script>
+<script src="js/draft-store.js?v=20260816"></script>
+<script src="js/receipt.js?v=20260805"></script>
+<script src="js/modules/contact.js?v=20260805"></script>
+<script src="js/modules/about.js?v=20260805"></script>
+<script src="js/modules/onboarding.js?v=20260805"></script>
+<script src="js/modules/tour.js?v=20260805"></script>
+<script src="js/modules/changelog.js?v=20260805"></script>
+<script src="js/modules/reviewPrompt.js?v=20260805"></script>
+<script src="js/modules/dashboard.js?v=20261120"></script>
+<script src="js/modules/reorder-list.js?v=20260817"></script>
+<script src="js/modules/pos.js?v=20260816"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js" crossorigin="anonymous"></script>
+<script src="js/modules/purchase.js?v=20261006"></script>
+<script src="js/modules/returns.js?v=20260805"></script>
+<script src="js/modules/opening.js?v=20260902"></script>
+<script src="js/modules/inventory.js?v=20260805"></script>
+<script src="js/modules/medicine.js?v=20260816"></script>
+<script src="js/modules/customers.js?v=20260806"></script>
+<script src="js/modules/suppliers.js?v=20260816"></script>
+<script src="js/modules/short-list.js?v=20261119"></script>
+<script src="js/modules/accounts.js?v=20260805"></script>
+<script src="js/modules/daily-report.js"></script>
+<script src="js/modules/maintenance.js"></script>
+<script src="js/modules/transfers.js"></script>
+<script src="js/modules/settings.js?v=20260806"></script>
+<script src="js/modules/admin.js?v=20260805"></script>
+<script src="js/modules/ads.js?v=20260805"></script>
+<script src="js/staff.js?v=20260805"></script>
+<script src="js/db-indexeddb.js?v=20261006"></script>
+<script src="js/sync-engine.js?v=20261006"></script>
+<script src="js/auth.js?v=20260805"></script>
+<script src="js/api-client.js?v=20260902"></script>
+<script src="js/ai-service.js?v=20260805"></script>
+<script src="js/modules/ai-settings.js?v=20260805"></script>
+<script src="js/modules/analytics.js?v=20260805"></script>
+<script src="js/pin-lock.js?v=20260806"></script>
+<script src="js/app.js?v=20261120"></script>
+<script>
+  if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+      // ✅ ফিক্স: updateViaCache:'none' — এটা ছাড়া GitHub Pages-এর
+      // HTTP cache-header-এর কারণে ব্রাউজার service-worker.js-এর নতুন
+      // ভার্সন কখনো চেক করত না, "নতুন আপডেট এসেছে" ব্যানারও আসত না।
+      navigator.serviceWorker.register('service-worker.js', { updateViaCache: 'none' })
+        .then((reg) => {
+          // ✅ ফিক্স: শুধু প্রথমবার (যখন এখনো কোনো controller নেই) টোস্ট
+          // দেখানো হবে, প্রতি রিলোডে না — নাহলে বারবার একই টোস্ট বিরক্তিকর
+          // হয়ে ওঠে এবং জরুরি "আপডেট" ব্যানারের প্রতি মনোযোগ কমিয়ে দেয়।
+          if (!navigator.serviceWorker.controller) {
+            toast('অফলাইন মোড সক্রিয় হয়েছে।', 's');
+          }
+
+          // ✅ নতুন ভার্সন ইতিমধ্যে "waiting" অবস্থায় থাকলে (পেজ খোলা
+          // থাকা অবস্থায় ডিপ্লয় হয়ে গেলে) সাথে সাথে ব্যানার দেখান
+          if (reg.waiting) showUpdateBanner(reg.waiting);
+
+          // ✅ নতুন SW install হয়ে "waiting" অবস্থায় গেলে ব্যানার দেখান
+          reg.addEventListener('updatefound', () => {
+            const newWorker = reg.installing;
+            if (!newWorker) return;
+            newWorker.addEventListener('statechange', () => {
+              if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+                showUpdateBanner(newWorker);
+              }
+            });
+          });
+
+          // ✅ ব্রাউজার শুধু page-navigation-এ স্বয়ংক্রিয়ভাবে আপডেট চেক করে —
+          // এই অ্যাপ একবার খুলে দীর্ঘক্ষণ ব্যবহার হতে পারে (SPA-এর মতো),
+          // তাই সক্রিয়ভাবেও চেক করা হচ্ছে: ট্যাব আবার visible হলে, এবং
+          // প্রতি ৩০ মিনিটে (যদি অ্যাপ খোলাই থাকে অনেকক্ষণ)
+          document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') reg.update().catch(() => {});
+          });
+          setInterval(() => reg.update().catch(() => {}), 30 * 60 * 1000);
+        })
+        .catch((err) => showFatalError('Service Worker রেজিস্ট্রেশন ব্যর্থ:\n' + err.message));
+
+      // ✅ ব্যবহারকারী "এখনই আপডেট করুন" চাপলে নতুন SW activate হবে,
+      // এবং activate সম্পন্ন হলে পেজ একবার রিলোড হবে যাতে নতুন কোড চালু হয়।
+      let refreshing = false;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (refreshing) return;
+        refreshing = true;
+        window.location.reload();
+      });
+    });
+  }
+
+  function showUpdateBanner(waitingWorker) {
+    if (document.getElementById('sw-update-banner')) return; // একবারই দেখাবে
+
+    const banner = document.createElement('div');
+    banner.id = 'sw-update-banner';
+    banner.className = 'fixed bottom-0 inset-x-0 z-[9999] bg-slate-900 dark:bg-slate-700 text-white px-4 py-3 flex items-center justify-center gap-4 shadow-lg flex-wrap';
+    banner.innerHTML = `
+      <span class="text-sm">অ্যাপের নতুন আপডেট এসেছে।</span>
+      <button id="sw-update-btn" class="bg-emerald-500 hover:bg-emerald-600 text-white text-sm font-semibold px-4 py-1.5 rounded-lg">
+        এখনই আপডেট করুন
+      </button>
+      <button id="sw-update-dismiss" class="text-slate-300 hover:text-white text-sm underline">
+        পরে
+      </button>
+    `;
+    document.body.appendChild(banner);
+
+    document.getElementById('sw-update-btn').addEventListener('click', () => {
+      waitingWorker.postMessage('SKIP_WAITING');
+      banner.remove();
+    });
+    document.getElementById('sw-update-dismiss').addEventListener('click', () => {
+      banner.remove();
+      // "পরে" চাপলে পরের বার অ্যাপ খোলা/রিলোড হলে আবার জিজ্ঞেস করবে
+    });
+  }
+</script>
+
+</body>
+</html>

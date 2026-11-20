@@ -1,0 +1,279 @@
+'use strict';
+
+function normalizeMedicineDemandName(name) {
+  return String(name || '').trim().replace(/\s+/g, ' ').toLocaleLowerCase('bn-BD');
+}
+
+function hasMedicinePurchaseHistory(medId) {
+  if (!medId) return false;
+  const purchased = (APP_STATE.purchases || []).some(p => (p.items || []).some(i => i.medId === medId));
+  if (purchased) return true;
+  const openingBatch = (APP_STATE.openingEntries || []).some(entry =>
+    entry.medId === medId || (entry.items || []).some(i => i.medId === medId) ||
+    (entry.batches || []).some(b => b.medId === medId)
+  );
+  return openingBatch || (APP_STATE.inventory || []).some(inv => inv.medId === medId && (inv.batches || []).some(b => (b.stock || 0) >= 0 && (b.batchId || b.batchNumber)));
+}
+
+function getEffectiveReorderLevel(medicine) {
+  if (medicine && medicine.reorderLevel !== undefined && medicine.reorderLevel !== null && medicine.reorderLevel !== '') {
+    const value = Number(medicine.reorderLevel);
+    if (Number.isFinite(value)) return Math.max(0, value);
+  }
+  const fallback = Number(APP_STATE?.lowStockLevel);
+  return Number.isFinite(fallback) ? Math.max(0, fallback) : 10;
+}
+
+// ════════════════════════════════════════════════════════════
+// SHARED FORMATTING & HELPER UTILITIES
+// সব মডিউল এখান থেকে ব্যবহার করবে — একবার লেখা, সবখানে reuse
+// ════════════════════════════════════════════════════════════
+
+function fmt(n) {
+  return parseFloat(n || 0).toLocaleString('bn-BD', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+function fmtK(n) {
+  n = parseFloat(n || 0);
+  if (n >= 100000) return (n / 100000).toFixed(1) + 'L';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return fmt(n);
+}
+
+function todayStr() {
+  return new Date().toISOString().split('T')[0];
+}
+
+function round2(n) {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+function esc(s) {
+  return String(s || '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// MM/YYYY ফরম্যাট থেকে Date object — Expiry alert-এর জন্য দরকার
+function parseExpiryDate(exp) {
+  if (!exp) return null;
+  const parts = String(exp).split('/');
+  if (parts.length === 2) return new Date(parseInt(parts[1]), parseInt(parts[0]), 0);
+  const d = new Date(exp);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// ════════════════════════════════════════════════════════════
+// ✅ ধাপ ৩১: ক্যালেন্ডার-সঠিক expiry comparator — parseExpiryDate()
+// ব্যবহার করে প্রকৃত Date তুলনা করে, "MM/YYYY" স্ট্রিং-এর lexicographic
+// (আভিধানিক) তুলনা না। আগে অনেক জায়গায় সরাসরি স্ট্রিং তুলনা হতো
+// (যেমন `a.expiry < b.expiry`), যেটা বছরের বাউন্ডারিতে ভুল অর্ডার
+// দিত — "01/2027" lexicographically "12/2026"-এর আগে পড়ে, যদিও
+// ক্যালেন্ডারে ডিসেম্বর ২০২৬ আগে। এখন থেকে batches sort করার সব
+// জায়গা এই একটাই হেল্পার ব্যবহার করবে।
+//
+// direction: 'asc' (soonest-expiry-first, FEFO deduction/nearestExpiry-এ
+// ব্যবহৃত) বা 'desc' (furthest-expiry-first, সাপ্লায়ার রিটার্ন/রাইট-অফ
+// legacy heuristic-এ ব্যবহৃত)। খালি/অপার্সেবল expiry সবসময় সবার শেষে
+// যাবে — কোনো দিকেই প্রায়োরিটাইজড হবে না।
+// ════════════════════════════════════════════════════════════
+function compareBatchExpiry(a, b, direction = 'asc') {
+  const da = parseExpiryDate(a.expiry), db = parseExpiryDate(b.expiry);
+  if (!da && !db) return 0;
+  if (!da) return 1;
+  if (!db) return -1;
+  return direction === 'asc' ? da - db : db - da;
+}
+
+function setText(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+// ✅ Draft/cart তালিকায় "কতক্ষণ আগে সংরক্ষিত" দেখানোর জন্য
+function formatRelativeTime(isoStr) {
+  const then = new Date(isoStr).getTime();
+  const diffMin = Math.floor((Date.now() - then) / 60000);
+  if (diffMin < 1) return 'এইমাত্র';
+  if (diffMin < 60) return `${diffMin} মিনিট আগে`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr} ঘণ্টা আগে`;
+  const d = new Date(isoStr);
+  return d.toLocaleDateString('bn-BD') + ' ' + d.toLocaleTimeString('bn-BD', { hour: '2-digit', minute: '2-digit' });
+}
+
+// ════════════════════════════════════════════════════════════
+// ✅ ধাপ ২৩: Inventory batch থেকে derived summary fields বের করার
+// কেন্দ্রীয় হেল্পার — totalStock/costValue/mrpValue/nearestExpiry/status
+// এই লজিক আগে inventory.js, pos.js, api-client.js — তিন জায়গায় আলাদাভাবে
+// duplicate ছিল, এখন এখান থেকেই সবাই ব্যবহার করবে (api-client.js-এর ছয়টা
+// ফাংশন এই ধাপে এটা ব্যবহার করছে; inventory.js/pos.js-এর নিজস্ব লোকাল
+// কপি এই ধাপে অক্ষত রাখা হয়েছে — সেটা আলাদা ঐচ্ছিক রিফ্যাক্টর)।
+//
+// batches: raw batch array (filter/sort করা নাও থাকতে পারে)
+// reorderLevel: এই ওষুধের নির্দিষ্ট বা global lowStockLevel
+// রিটার্ন করে: { batches (stock>0, expiry অনুযায়ী sorted), totalStock,
+//               costValue, mrpValue, nearestExpiry, status }
+// ════════════════════════════════════════════════════════════
+function computeInventoryDerivedFields(batches, reorderLevel) {
+  if (batches != null && !Array.isArray(batches)) {
+    throw new Error('ইনভেন্টরি batch তালিকা বৈধ নয়।');
+  }
+  const normalized = (batches || []).map(batch => {
+    if (!batch || typeof batch !== 'object') {
+      throw new Error('ইনভেন্টরিতে অবৈধ batch তথ্য আছে।');
+    }
+    const numberField = (value, field, fallback) => {
+      if (value === undefined || value === null || value === '') return fallback;
+      const number = Number(value);
+      if (!Number.isFinite(number)) throw new Error(`ইনভেন্টরি batch-এর ${field} বৈধ সংখ্যা নয়।`);
+      return number;
+    };
+    if (batch.stock === undefined || batch.stock === null || batch.stock === '') {
+      throw new Error('ইনভেন্টরি batch-এর stock অনুপস্থিত।');
+    }
+    return {
+      ...batch,
+      stock: numberField(batch.stock, 'stock', 0),
+      cost: numberField(batch.cost, 'cost', 0),
+      mrp: numberField(batch.mrp, 'mrp', 0),
+      sell: numberField(batch.sell, 'sell', 0),
+    };
+  });
+  const filtered = normalized.filter(batch => batch.stock > 0);
+  filtered.sort((a, b) => compareBatchExpiry(a, b, 'asc')); // ✅ ধাপ ৩১ ফিক্স
+
+  const totalStock = filtered.reduce((a, b) => a + b.stock, 0);
+  const costValue = round2(filtered.reduce((a, b) => a + (b.cost || 0) * b.stock, 0));
+  const mrpValue = round2(filtered.reduce((a, b) => a + (b.mrp || 0) * b.stock, 0));
+  const nearestExpiry = filtered[0]?.expiry || '';
+
+  const fallback = Number.isFinite(Number(reorderLevel)) ? Number(reorderLevel) : 10;
+  const rl = Math.max(0, fallback);
+  const status = totalStock === 0 ? 'out' : totalStock <= rl ? 'low' : 'ok';
+
+  return { batches: filtered, totalStock, costValue, mrpValue, nearestExpiry, status };
+}
+// ════════════════════════════════════════════════════════════
+// MEDICINE MATCH RESOLVER — ধাপ ২৫: pos.js ও purchase.js দুই জায়গা
+// থেকেই কল হয়। exact match, single-unambiguous-partial-match হলে
+// সরাসরি resolve করে; একাধিক partial match হলে ambiguous রিটার্ন
+// করে — কলার তখন disambiguation UI দেখাবে, silent-select করবে না।
+// ════════════════════════════════════════════════════════════
+function resolveMedicineMatch(query, list, textFn) {
+  const val = String(query || '').trim();
+  if (!val) return { type: 'none' };
+  const valLower = val.toLowerCase();
+
+  // ১. Exact match (পুরো ডিসপ্লে-টেক্সট হুবহু মেলে, কেস-ইনসেনসিটিভ)
+  const exactMatches = list.filter(item => textFn(item).trim().toLowerCase() === valLower);
+  if (exactMatches.length === 1) return { type: 'exact', match: exactMatches[0] };
+  if (exactMatches.length > 1) return { type: 'ambiguous', matches: exactMatches }; // ডুপ্লিকেট-নাম এজ-কেস
+
+  // ২. Partial match
+  const partial = list.filter(item => textFn(item).toLowerCase().includes(valLower));
+  if (partial.length === 1) return { type: 'exact', match: partial[0] }; // একটাই মিলেছে — দ্ব্যর্থহীন
+  if (partial.length > 1) return { type: 'ambiguous', matches: partial };
+
+  return { type: 'none' };
+}
+
+// ════════════════════════════════════════════════════════════
+// ✅ সাধারণ clamp হেল্পার — POS/Purchase-এর qty/price/discount
+// ক্ল্যাম্প করতে ব্যবহৃত হয়, বিলিং-ইন্টিগ্রিটি রক্ষায়।
+// ════════════════════════════════════════════════════════════
+function clamp(val, min, max) {
+  return Math.min(max, Math.max(min, val));
+}
+
+// ────────────────────────────────────────────────────────────
+// Direct-unit display and legacy batch-data helpers.
+// ────────────────────────────────────────────────────────────
+function positivePackNumber(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.max(1, Math.floor(n)) : fallback;
+}
+
+function formatUnitQuantity(quantity) {
+  const units = Math.max(0, Math.floor(Number(quantity) || 0));
+  return `${units.toLocaleString('bn-BD')} ইউনিট`;
+}
+
+// ════════════════════════════════════════════════════════════
+// ✅ ধাপ ০.৩: NETWORK ERROR CODES — single source of truth।
+// api-client.js-এর isConnectivityError() ও এই ফাইলের humanizeError()
+// দুটোই এই একই লিস্ট ব্যবহার করে — duplicate maintenance এড়াতে।
+// ════════════════════════════════════════════════════════════
+const NETWORK_ERROR_CODES = [
+  'unavailable', 'deadline-exceeded', 'cancelled', 'internal',
+  'unknown', 'aborted', 'resource-exhausted', 'client-timeout',
+];
+
+// ════════════════════════════════════════════════════════════
+// ✅ ধাপ ০.৩: RAW ERROR → USER-FRIENDLY বাংলা মেসেজ
+// - Firestore/network error code থাকলে → পরিচিত বাংলা বার্তা
+// - err.code নেই কিন্তু err.message বাংলায় → এটা আমাদের নিজের
+//   throw new Error('বাংলা মেসেজ') — ইতিমধ্যে user-friendly, pass-through
+// - বাকি সব (genuine JS bug, unexpected error) → generic fallback,
+//   raw detail শুধু showFatalError()-এর collapsible অংশে যাবে
+// ════════════════════════════════════════════════════════════
+function humanizeError(err) {
+  const code = err?.code || '';
+
+  const codeMap = {
+    'permission-denied': 'অনুমতি নেই — সম্ভবত আপনার অ্যাকাউন্ট স্ট্যাটাস পরিবর্তিত হয়েছে। পেজ রিফ্রেশ করে আবার চেষ্টা করুন।',
+    'not-found': 'তথ্যটি খুঁজে পাওয়া যায়নি — সম্ভবত অন্য কোথাও থেকে ইতিমধ্যে মুছে ফেলা হয়েছে।',
+    'already-exists': 'এই তথ্য ইতিমধ্যে বিদ্যমান।',
+    'unauthenticated': 'সেশনের মেয়াদ শেষ — আবার লগইন করুন।',
+    'invalid-argument': 'পাঠানো তথ্যে সমস্যা আছে — আবার চেষ্টা করুন, সমস্যা থাকলে ফর্মটা যাচাই করুন।',
+  };
+  if (codeMap[code]) return codeMap[code];
+  if (NETWORK_ERROR_CODES.includes(code)) {
+    return 'সার্ভারের সাথে সংযোগে সমস্যা হয়েছে — একটু পর আবার চেষ্টা করুন।';
+  }
+
+  const msg = err?.message || '';
+  const isBengaliMsg = /[\u0980-\u09FF]/.test(msg); // আমাদের নিজের throw new Error('...') শনাক্ত করতে
+  if (isBengaliMsg) return msg;
+
+  return 'একটা অপ্রত্যাশিত সমস্যা হয়েছে। সমস্যা থেকে গেলে অ্যাপ রিফ্রেশ করুন বা যোগাযোগ করুন।';
+}
+
+// ✅ নতুন — গ্রস (সামগ্রিক) ছাড় eligible আইটেমে অনুপাতে বণ্টন। ইনলাইন-ছাড়
+// থাকা আইটেম (getInlineDiscount(item) > 0) বাদ যায়। rounding-drift এড়াতে
+// শেষ eligible আইটেমে remainder বসানো হয়, যাতে যোগফল ঠিক grossDiscountAmt-এর
+// সমান হয় — accounting-এর জন্য এটা গুরুত্বপূর্ণ (penny mismatch চলবে না)।
+function distributeGrossDiscount(items, grossDiscountAmt, getGross, getInlineDiscount) {
+  const map = new Map();
+  const eligible = items.filter(it => !(getInlineDiscount(it) > 0));
+  const eligibleGrossTotal = round2(eligible.reduce((a, it) => a + getGross(it), 0));
+  if (eligibleGrossTotal <= 0 || grossDiscountAmt <= 0) {
+    eligible.forEach(it => map.set(it, 0));
+    return map;
+  }
+  let allocated = 0;
+  eligible.forEach((it, idx) => {
+    let share;
+    if (idx === eligible.length - 1) {
+      share = round2(grossDiscountAmt - allocated);
+    } else {
+      share = round2((getGross(it) / eligibleGrossTotal) * grossDiscountAmt);
+    }
+    allocated = round2(allocated + share);
+    map.set(it, Math.max(0, share));
+  });
+  return map;
+}
+
+// ✅ নতুন — Brand-name normalization। OCR/AI প্রায়ই non-breaking space,
+// curly quote, en/em-dash বসিয়ে দেয় — দেখতে ইংরেজি কিন্তু isEnglishBrand()-এর
+// কড়া regex ব্যর্থ হয়। সেভের আগে এখানে normalize করা হয়।
+function normalizeBrandText(str) {
+  return String(str || '')
+    .replace(/[\u2018\u2019\u201A\u201B]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F]/g, '"')
+    .replace(/[\u2012\u2013\u2014\u2212]/g, '-')
+    .replace(/[\u00A0\u2000-\u200B]/g, ' ')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
