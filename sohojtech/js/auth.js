@@ -106,6 +106,7 @@ async function resolveIdentity(user) {
       }
     }
 
+    console.warn("[AuthStep] staff lookup result", { docId: matchedDocId, exists: staffSnap.exists, data: staffSnap.exists ? staffSnap.data() : null });
     if (staffSnap.exists) {
       let staff = staffSnap.data() || {};
       if (String(staff.email || '').trim().toLowerCase() !== normalizedEmail) {
@@ -169,6 +170,7 @@ async function resolveIdentity(user) {
     }
     activateOwner(user, requestData, requestData);
   } catch (err) {
+    console.error("[AuthStep] resolveIdentity error", err);
     showFatalError('Identity যাচাই করতে সমস্যা:\n' + err.message, err);
   }
 }
