@@ -85,6 +85,7 @@ async function resolveIdentity(user) {
           String(owner.email || '').toLowerCase() === String(user.email || '').toLowerCase() &&
           String(owner.role || '').toLowerCase() === 'owner') {
         const platformUser = await getPlatformUserRecord(user.uid, owner);
+        if (typeof restoreFirebaseByokFromRecord === "function") restoreFirebaseByokFromRecord(platformUser);
         activateOwner(user, owner, platformUser);
         return;
       }
@@ -167,6 +168,7 @@ async function resolveIdentity(user) {
       }
       console.warn("[AuthStep] calling getPlatformUserRecord", { ownerUid: staff.ownerUid });
       const platformUser = await getPlatformUserRecord(staff.ownerUid, null);
+      if (typeof restoreFirebaseByokFromRecord === "function") restoreFirebaseByokFromRecord(platformUser);
       console.warn("[AuthStep] getPlatformUserRecord done", { hasPlatformUser: !!platformUser });
       console.warn("[AuthStep] activating staff", { uid: user.uid, ownerUid: staff.ownerUid, status: staff.status, active: staff.active });
       await activateStaff(user, staff, platformUser);

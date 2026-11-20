@@ -450,6 +450,7 @@ async function saveFirebaseByokConfigForm() {
         const snap = await ref.get();
         const byokFields = {
           byokProjectId: saved.projectId,
+          byokFirebaseConfig: saved,
           byokUpdatedAt: firebase.firestore.FieldValue.serverTimestamp(),
         };
         if (!snap.exists) {
@@ -480,10 +481,20 @@ async function saveFirebaseByokConfigForm() {
   }
 }
 
-function clearFirebaseByokConfigForm() {
+async function clearFirebaseByokConfigForm() {
   if (requireFirebaseSetupOwner()) return;
   clearFirebaseByokConfig();
-  setFirebaseByokStatus('এই ডিভাইসের Client Firebase config মুছে ফেলা হয়েছে।', 's');
+  const authUser = (typeof fbAuth !== "undefined" && fbAuth?.currentUser) || APP_STATE?.currentUser;
+  if (typeof fbDb !== "undefined" && fbDb && authUser?.uid) {
+    try {
+      await fbDb.collection("platformUsers").doc(authUser.uid).set({
+        byokProjectId: firebase.firestore.FieldValue.delete(),
+        byokFirebaseConfig: firebase.firestore.FieldValue.delete(),
+        byokUpdatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+    } catch (_) {}
+  }
+  setFirebaseByokStatus("Client Firebase config এবং ক্লাউড BYOK সেটিংস মুছে ফেলা হয়েছে।", "s");
 }
 
 // ────────────────────────────────────────────────────────────

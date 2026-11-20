@@ -149,10 +149,22 @@ function clearFirebaseByokConfig() {
   localStorage.removeItem(FIREBASE_BYOK_STORAGE_KEY);
 }
 
+function restoreFirebaseByokFromRecord(record) {
+  if (!record || typeof record !== "object") return null;
+  const candidate = record.byokFirebaseConfig || record.firebaseByokConfig || null;
+  if (!candidate) return null;
+  const res = validateFirebaseByokConfig(candidate);
+  if (!res.valid) return null;
+  try {
+    localStorage.setItem(FIREBASE_BYOK_STORAGE_KEY, JSON.stringify(res.config));
+  } catch (_) {}
+  return res.config;
+}
+
 function getEffectiveFirebaseConfig() {
-  if (isSuperAdminUser()) return APP_CONFIG.firebase;
-  const entitlement = typeof APP_STATE !== 'undefined' ? APP_STATE.platformEntitlement : null;
-  const access = platformAccessState(entitlement);
+  if (typeof isSuperAdminUser === "function" && isSuperAdminUser()) return APP_CONFIG.firebase;
+  const entitlement = typeof APP_STATE !== "undefined" ? APP_STATE.platformEntitlement : null;
+  const access = typeof platformAccessState === "function" ? platformAccessState(entitlement) : { active: false };
   return access.active ? (getFirebaseByokConfig() || APP_CONFIG.firebase) : APP_CONFIG.firebase;
 }
 
