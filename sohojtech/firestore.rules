@@ -236,7 +236,7 @@ service cloud.firestore {
     }
 
     match /staff/{staffUid} {
-      allow read: if (isOwner() && resource.data.ownerUid == request.auth.uid)
+      allow get: if (isOwner() && resource.data.ownerUid == request.auth.uid)
         || (signedIn() && (
           request.auth.uid == staffUid
           || (
@@ -246,6 +246,14 @@ service cloud.firestore {
             && resource.data.status == 'invited'
           )
         ));
+      allow list: if isOwner()
+        || (
+          signedIn()
+          && request.auth.token.email != null
+          && resource.data.email is string
+          && resource.data.email.lower() == request.auth.token.email.lower()
+          && resource.data.status == 'invited'
+        );
       allow create: if (
         isOwner()
         && request.resource.data.ownerUid == request.auth.uid
