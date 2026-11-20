@@ -1,6 +1,17 @@
 'use strict';
 
 let transferLines = [];
+let activeTransferLedgerType = 'medicine';
+
+function normalizeTransferType(transfer) {
+  return transfer.type === 'cash' || transfer.type === 'assets'
+    ? transfer.type
+    : 'medicine';
+}
+
+function filterTransferLedgerRows(rows, type) {
+  return (rows || []).filter(row => normalizeTransferType(row) === type);
+}
 
 function renderTransfersModule() {
   if (!APP_STATE.isOwner && !hasTransferPermission()) {
@@ -11,8 +22,8 @@ function renderTransfersModule() {
   transferLines = transferLines.length ? transferLines : [{ medId: '', batchId: '', qty: 1 }];
   const c = document.getElementById('transfers-content');
   c.innerHTML = `
-    <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5 mb-4">
-      <h5 class="text-sm font-semibold mb-4"><i class="fa-solid fa-arrow-right-arrow-left text-brand mr-2"></i>Branch-to-Branch Stock Transfer</h5>
+    <div id="transfer-panel-medicine" class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5 mb-4">
+      <h5 class="text-sm font-semibold mb-4"><i class="fa-solid fa-arrow-right-arrow-left text-brand mr-2"></i>ওষুধ Branch-to-Branch Transfer</h5>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mb-4">
         <div><label class="text-xs text-slate-500">উৎস Branch</label><select id="transfer-source" onchange="refreshTransferMedicines()" class="w-full mt-1 px-3 py-2 border rounded-lg text-sm">${renderBranchOptions(APP_STATE.activeBranchId)}</select></div>
         <div><label class="text-xs text-slate-500">গন্তব্য Branch</label><select id="transfer-target" class="w-full mt-1 px-3 py-2 border rounded-lg text-sm">${renderBranchOptions('', true)}</select></div>
@@ -28,19 +39,70 @@ function renderTransfersModule() {
         <div id="transfer-error" class="text-xs text-red-500"></div>
       </div>
     </div>
+    <div id="transfer-panel-cash" class="hidden bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5 mb-4">
+      <h5 class="text-sm font-semibold mb-4"><i class="fa-solid fa-money-bill-transfer text-brand mr-2"></i>নগদ/Bank Transfer প্রস্তুত করুন</h5>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div><label class="text-xs text-slate-500">উৎস Branch</label><select id="transfer-cash-source" onchange="refreshTransferTargets('cash')" class="w-full mt-1 px-3 py-2 border rounded-lg text-sm">${renderBranchOptions(APP_STATE.activeBranchId, false, 'transfer-cash-source')}</select></div>
+        <div><label class="text-xs text-slate-500">গন্তব্য Branch</label><select id="transfer-cash-target" class="w-full mt-1 px-3 py-2 border rounded-lg text-sm">${renderBranchOptions('', true, 'transfer-cash-source')}</select></div>
+        <input id="transfer-cash-amount" type="number" min="0.01" step="0.01" placeholder="পরিমাণ" class="px-3 py-2 border rounded-lg text-sm"/>
+        <select id="transfer-cash-mode" class="px-3 py-2 border rounded-lg text-sm"><option value="cash">নগদ</option><option value="bank">Bank</option></select>
+        <input id="transfer-cash-confirmation" maxlength="160" placeholder="রেফারেন্স/নোট (ঐচ্ছিক)" class="px-3 py-2 border rounded-lg text-sm"/>
+        <button onclick="createCashTransfer()" class="btn btn-primary btn-sm">Owner অনুমোদনের জন্য পাঠান</button>
+      </div>
+      <div id="transfer-cash-error" class="text-xs text-red-500 mt-2"></div>
+      <p class="text-xs text-amber-600 mt-2">Owner অনুমোদন না হওয়া পর্যন্ত কোনো অর্থ settlement হবে না।</p>
+    </div>
+    <div id="transfer-panel-assets" class="hidden bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5 mb-4">
+      <h5 class="text-sm font-semibold mb-4"><i class="fa-solid fa-boxes-stacked text-brand mr-2"></i>সম্পদ Branch Transfer প্রস্তুত করুন</h5>
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div><label class="text-xs text-slate-500">উৎস Branch</label><select id="transfer-assets-source" onchange="refreshTransferTargets('assets')" class="w-full mt-1 px-3 py-2 border rounded-lg text-sm">${renderBranchOptions(APP_STATE.activeBranchId, false, 'transfer-assets-source')}</select></div>
+        <div><label class="text-xs text-slate-500">গন্তব্য Branch</label><select id="transfer-assets-target" class="w-full mt-1 px-3 py-2 border rounded-lg text-sm">${renderBranchOptions('', true, 'transfer-assets-source')}</select></div>
+        <input id="transfer-assets-id" maxlength="100" placeholder="সম্পদের ID / Serial" class="px-3 py-2 border rounded-lg text-sm"/>
+        <input id="transfer-assets-name" maxlength="160" placeholder="সম্পদের নাম" class="px-3 py-2 border rounded-lg text-sm"/>
+        <input id="transfer-assets-note" maxlength="160" placeholder="নোট (ঐচ্ছিক)" class="px-3 py-2 border rounded-lg text-sm"/>
+        <button onclick="createAssetTransfer()" class="btn btn-primary btn-sm">Owner অনুমোদনের জন্য পাঠান</button>
+      </div>
+      <div id="transfer-assets-error" class="text-xs text-red-500 mt-2"></div>
+      <p class="text-xs text-amber-600 mt-2">Owner অনুমোদনের পরেই সম্পদের Branch movement সম্পন্ন হবে।</p>
+    </div>
     <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5">
       <h5 class="text-sm font-semibold mb-3">Transfer Ledger</h5>
+      <div class="flex flex-wrap gap-2 mb-3">
+        <button id="transfer-tab-medicine" onclick="setTransferLedgerType('medicine')" class="btn btn-primary btn-sm">ওষুধ</button>
+        <button id="transfer-tab-cash" onclick="setTransferLedgerType('cash')" class="btn btn-brand-outline btn-sm">নগদ/Bank</button>
+        <button id="transfer-tab-assets" onclick="setTransferLedgerType('assets')" class="btn btn-brand-outline btn-sm">সম্পদ</button>
+      </div>
       <div id="transfer-ledger" class="text-sm"></div>
     </div>`;
+  setTransferLedgerType(activeTransferLedgerType);
   refreshTransferMedicines();
   loadTransferLedger();
 }
 
-function renderBranchOptions(selectedId, excludeSource) {
-  const source = document.getElementById('transfer-source')?.value || APP_STATE.activeBranchId;
+function renderBranchOptions(selectedId, excludeSource, sourceSelectId = 'transfer-source') {
+  const source = document.getElementById(sourceSelectId)?.value || APP_STATE.activeBranchId;
   return APP_STATE.branches
     .filter(b => !excludeSource || b.id !== source)
     .map(b => `<option value="${esc(b.id)}" ${b.id === selectedId ? 'selected' : ''}>${esc(b.name)}</option>`).join('');
+}
+
+function refreshTransferTargets(type) {
+  const sourceId = `transfer-${type}-source`;
+  const targetId = `transfer-${type}-target`;
+  const target = document.getElementById(targetId);
+  if (target) target.innerHTML = renderBranchOptions(target.value, true, sourceId);
+}
+
+function setTransferLedgerType(type) {
+  if (!['medicine', 'cash', 'assets'].includes(type)) return;
+  activeTransferLedgerType = type;
+  ['medicine', 'cash', 'assets'].forEach(ledgerType => {
+    const panel = document.getElementById(`transfer-panel-${ledgerType}`);
+    const tab = document.getElementById(`transfer-tab-${ledgerType}`);
+    if (panel) panel.classList.toggle('hidden', ledgerType !== type);
+    if (tab) tab.className = `btn ${ledgerType === type ? 'btn-primary' : 'btn-brand-outline'} btn-sm`;
+  });
+  renderTransferLedger();
 }
 
 async function refreshTransferMedicines() {
@@ -126,6 +188,66 @@ async function executeBranchTransfer() {
   }
 }
 
+async function createCashTransfer() {
+  const sourceId = document.getElementById('transfer-cash-source').value;
+  const targetId = document.getElementById('transfer-cash-target').value;
+  const source = APP_STATE.branches.find(branch => branch.id === sourceId);
+  const target = APP_STATE.branches.find(branch => branch.id === targetId);
+  const result = await apiCreateTransfer({
+    type: 'cash',
+    sourceBranchId: sourceId,
+    targetBranchId: targetId,
+    sourceBranchName: source?.name || sourceId,
+    targetBranchName: target?.name || targetId,
+    amount: document.getElementById('transfer-cash-amount').value,
+    paymentMode: document.getElementById('transfer-cash-mode').value,
+    confirmationNote: document.getElementById('transfer-cash-confirmation').value.trim(),
+  });
+  document.getElementById('transfer-cash-error').textContent = result.success ? '' : result.message;
+  if (result.success) {
+    toast(result.message, 's');
+    document.getElementById('transfer-cash-amount').value = '';
+    document.getElementById('transfer-cash-confirmation').value = '';
+    loadTransferLedger();
+  }
+}
+
+async function createAssetTransfer() {
+  const sourceId = document.getElementById('transfer-assets-source').value;
+  const targetId = document.getElementById('transfer-assets-target').value;
+  const source = APP_STATE.branches.find(branch => branch.id === sourceId);
+  const target = APP_STATE.branches.find(branch => branch.id === targetId);
+  const result = await apiCreateTransfer({
+    type: 'assets',
+    sourceBranchId: sourceId,
+    targetBranchId: targetId,
+    sourceBranchName: source?.name || sourceId,
+    targetBranchName: target?.name || targetId,
+    assetId: document.getElementById('transfer-assets-id').value.trim(),
+    assetName: document.getElementById('transfer-assets-name').value.trim(),
+    note: document.getElementById('transfer-assets-note').value.trim(),
+  });
+  document.getElementById('transfer-assets-error').textContent = result.success ? '' : result.message;
+  if (result.success) {
+    toast(result.message, 's');
+    document.getElementById('transfer-assets-id').value = '';
+    document.getElementById('transfer-assets-name').value = '';
+    document.getElementById('transfer-assets-note').value = '';
+    loadTransferLedger();
+  }
+}
+
+async function approveTransfer(transferId) {
+  const transfer = (APP_STATE.interBranchTransfers || []).find(row =>
+    row.transferId === transferId || row.id === transferId
+  );
+  if (!transfer) return toast('Transfer record পাওয়া যায়নি।', 'e');
+  const result = await apiApproveTransfer(transfer);
+  if (!result.success) return toast(result.message, 'e');
+  toast(result.message, 's');
+  loadTransferLedger();
+}
+
 async function loadTransferLedger() {
   const box = document.getElementById('transfer-ledger');
   if (!box) return;
@@ -137,10 +259,14 @@ async function loadTransferLedger() {
     const transfers = new Map();
     for (let i = 0; i < branchIds.length; i += 10) {
       const branchBatch = branchIds.slice(i, i + 10);
-      const snapshots = await Promise.all(['sourceBranchId', 'targetBranchId'].map(field =>
-        fbDb.collection('transfers').where(field, 'in', branchBatch)
-          .orderBy('createdAt', 'desc').limit(100).get()
-      ));
+      const queries = [];
+      ['sourceBranchId', 'targetBranchId'].forEach(field => {
+        ['medicine', 'stock', 'cash', 'assets'].forEach(type => {
+          queries.push(fbDb.collection('transfers').where(field, 'in', branchBatch)
+            .where('type', '==', type).orderBy('createdAt', 'desc').limit(100).get());
+        });
+      });
+      const snapshots = await Promise.all(queries);
       snapshots.flatMap(snap => snap.docs).forEach(doc => {
         if (!transfers.has(doc.id)) transfers.set(doc.id, { id: doc.id, ...doc.data() });
       });
@@ -153,13 +279,34 @@ async function loadTransferLedger() {
       })
       .slice(0, 100);
     APP_STATE.interBranchTransfers = rows;
-    box.innerHTML = rows.length ? rows.map(r => `
-      <div class="border-t py-3 flex justify-between gap-3">
-        <div><div class="font-semibold">${esc(r.sourceBranchName || r.sourceBranchId)} <i class="fa-solid fa-arrow-right mx-1"></i> ${esc(r.targetBranchName || r.targetBranchId)}</div>
-        <div class="text-xs text-slate-400">${esc(r.transferId)} • ${(r.lines || []).length} line • ${esc(r.paymentMode || 'none')}</div></div>
-        <span class="text-xs text-emerald-600 font-semibold">সম্পন্ন</span>
-      </div>`).join('') : '<div class="text-slate-400">কোনো transfer নেই।</div>';
+    renderTransferLedger();
   } catch (err) {
     box.innerHTML = `<div class="text-red-500 text-xs">${esc(err.message)}</div>`;
   }
+}
+
+function renderTransferLedger() {
+  const box = document.getElementById('transfer-ledger');
+  if (!box) return;
+  const rows = filterTransferLedgerRows(APP_STATE.interBranchTransfers, activeTransferLedgerType);
+  box.innerHTML = rows.length ? rows.map(row => {
+    const type = normalizeTransferType(row);
+    const isPending = row.status === 'pending_owner_approval' && row.approved !== true;
+    const details = type === 'medicine'
+      ? `${(row.lines || []).length} line • ${esc(row.paymentMode || 'none')}`
+      : type === 'cash'
+        ? `৳${fmt(row.amount || 0)} • ${esc(row.paymentMode || '')}${row.confirmationNote ? ` • ${esc(row.confirmationNote)}` : ''}`
+        : `${esc(row.assetName || 'সম্পদ')} • ID: ${esc(row.assetId || '—')}`;
+    const status = isPending
+      ? '<span class="text-xs text-amber-600 font-semibold">Owner অনুমোদনের অপেক্ষায়</span>'
+      : '<span class="text-xs text-emerald-600 font-semibold">সম্পন্ন</span>';
+    const approveButton = isPending && APP_STATE.isOwner
+      ? `<button onclick="approveTransfer('${esc(row.transferId || row.id)}')" class="btn btn-primary btn-sm">অনুমোদন ও ${type === 'cash' ? 'settlement' : 'movement'}</button>`
+      : '';
+    return `<div class="border-t py-3 flex flex-wrap items-center justify-between gap-3">
+      <div><div class="font-semibold">${esc(row.sourceBranchName || row.sourceBranchId)} <i class="fa-solid fa-arrow-right mx-1"></i> ${esc(row.targetBranchName || row.targetBranchId)}</div>
+      <div class="text-xs text-slate-400">${esc(row.transferId || row.id)} • ${details}</div></div>
+      <div class="flex items-center gap-2">${status}${approveButton}</div>
+    </div>`;
+  }).join('') : '<div class="text-slate-400">এই ধরনের কোনো transfer নেই।</div>';
 }
