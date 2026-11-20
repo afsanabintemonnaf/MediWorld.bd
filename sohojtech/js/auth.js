@@ -83,7 +83,6 @@ async function resolveIdentity(user) {
     if (!staffSnap.exists && normalizedEmail) {
       const byEmailSnap = await fbDb.collection('staff')
         .where('email', '==', normalizedEmail)
-        .where('status', '==', 'invited')
         .limit(1)
         .get();
       if (!byEmailSnap.empty) {
