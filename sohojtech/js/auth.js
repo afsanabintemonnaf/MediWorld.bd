@@ -414,7 +414,19 @@ function unlockApp(profile) {
 
 function signInWithGoogle() {
   const provider = new firebase.auth.GoogleAuthProvider();
-  fbAuth.signInWithPopup(provider).catch((err) => toast('লগইন ব্যর্থ: ' + err.message, 'e'));
+  provider.setCustomParameters({ prompt: 'select_account' });
+  fbAuth.signInWithPopup(provider).catch((err) => {
+    const code = err && err.code ? String(err.code) : '';
+    if (
+      code === 'auth/popup-blocked' ||
+      code === 'auth/operation-not-supported-in-this-environment'
+    ) {
+      return fbAuth.signInWithRedirect(provider).catch((redirErr) => {
+        toast('লগইন ব্যর্থ: ' + redirErr.message, 'e');
+      });
+    }
+    toast('লগইন ব্যর্থ: ' + err.message, 'e');
+  });
 }
 
 function signOutUser() {
