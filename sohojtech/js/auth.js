@@ -98,6 +98,7 @@ async function resolveIdentity(user) {
         .where('email', '==', normalizedEmail)
         .limit(1)
         .get();
+      console.warn("[AuthStep] step3 staff.where(email) done", { empty: byEmailSnap.empty, size: byEmailSnap.size });
       if (!byEmailSnap.empty) {
         const candidateDoc = byEmailSnap.docs[0];
         const candidateData = candidateDoc.data() || {};
