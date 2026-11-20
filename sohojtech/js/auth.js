@@ -7,6 +7,7 @@ let ownerUnsub = null;
 let staffUnsub = null;
 let mainAppBooted = false;
 let entitlementExpiryTimer = null;
+let resolvingUid = null;
 
 function initAuthGate() {
   try {
@@ -37,6 +38,7 @@ function initAuthGate() {
     mainAppBooted = false;
 
     if (!user) {
+      resolvingUid = null;
       resetIdentityState();
       showAuthScreen('login');
       return;
@@ -64,6 +66,11 @@ function resetIdentityState() {
 }
 
 async function resolveIdentity(user) {
+  if (resolvingUid === user.uid) {
+    console.warn("[AuthStep] skipping duplicate resolveIdentity for", user.uid);
+    return;
+  }
+  resolvingUid = user.uid;
   console.warn("[AuthTrace] resolveIdentity start", { uid: user.uid, email: user.email });
   const ownerRef = fbDb.collection('owners').doc(user.uid);
   try {
@@ -183,6 +190,8 @@ async function resolveIdentity(user) {
   } catch (err) {
     console.error("[AuthStep] resolveIdentity error", err);
     showFatalError('Identity যাচাই করতে সমস্যা:\n' + err.message, err);
+  } finally {
+    if (resolvingUid === user.uid) resolvingUid = null;
   }
 }
 
