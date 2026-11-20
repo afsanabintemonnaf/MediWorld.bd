@@ -1,8 +1,31 @@
 'use strict';
 
+let ADMIN_FILTER_STATUS = 'all';
+
 function requireSuperAdmin() {
   if (APP_STATE.isSuperAdmin === true && isSuperAdminUser()) return false;
   toast(`${APP_CONFIG.PLATFORM_NAME} Platform User Management ও billing controls শুধু Super Admin পরিচালনা করতে পারবেন।`, 'e');
+  return true;
+}
+
+function setAdminFilterStatus(status) {
+  ADMIN_FILTER_STATUS = ['all', 'pending', 'approved', 'revoked'].includes(status)
+    ? status
+    : 'all';
+  renderAdminModule();
+}
+
+function matchesAdminFilter(user) {
+  const access = platformAccessState(user);
+  if (ADMIN_FILTER_STATUS === 'pending') {
+    return access.status === 'pending' || (access.status === 'active' && !access.active);
+  }
+  if (ADMIN_FILTER_STATUS === 'approved') {
+    return access.status === 'active' && access.active;
+  }
+  if (ADMIN_FILTER_STATUS === 'revoked') {
+    return access.status === 'revoked' || access.status === 'past_due' || access.status === 'unpaid';
+  }
   return true;
 }
 
@@ -18,59 +41,94 @@ async function renderAdminModule() {
     const snapshot = await fbDb.collection('platformUsers').get();
     const users = snapshot.docs.map(doc => ({ uid: doc.id, ...doc.data() }))
       .sort((a, b) => dateValue(b.createdAt) - dateValue(a.createdAt));
+    const filteredUsers = users.filter(matchesAdminFilter);
+
+    const tabs = [
+      { id: 'pending', label: 'পেন্ডিং' },
+      { id: 'approved', label: 'Approved' },
+      { id: 'revoked', label: 'Revoked' },
+      { id: 'all', label: 'সব' },
+    ];
+
     c.innerHTML = `
-      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5 mb-4">
-        <h3 class="font-semibold"><i class="fa-solid fa-shield-halved text-brand mr-2"></i>${esc(APP_CONFIG.PLATFORM_NAME)} — Super Admin Platform User Management</h3>
-        <p class="text-xs text-slate-500 mt-2">এককালীন setup ৳১০,০০০ · ঐচ্ছিক store setup +৳৫,০০০ · maintenance ৳১,৫০০/মাস। Owner-এর নিজের workspace-এর Branch ও Staff ব্যবস্থাপনা আলাদা।</p>
-        <div class="mt-3 text-xs text-slate-500">মোট আবেদন: ${users.length} · যোগাযোগ: ${esc(APP_CONFIG.SUPPORT_PHONE)}</div>
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-4 md:p-5 mb-4">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 class="font-semibold text-base"><i class="fa-solid fa-shield-halved text-brand mr-2"></i>ইউজার ম্যানেজমেন্ট (${users.length})</h3>
+            <p class="text-xs text-slate-500 mt-1">${esc(APP_CONFIG.PLATFORM_NAME)} · Setup ৳১০,০০০ · Store setup +৳৫,০০০ · Maintenance ৳১,৫০০/মাস · ${esc(APP_CONFIG.SUPPORT_PHONE)}</p>
+          </div>
+          <div class="flex flex-wrap gap-1.5" role="tablist" aria-label="User status filter">
+            ${tabs.map(t => {
+              const active = ADMIN_FILTER_STATUS === t.id;
+              return `<button type="button" onclick="setAdminFilterStatus('${t.id}')" class="px-3 py-1.5 rounded-lg text-xs font-medium transition ${active
+                ? 'bg-brand text-white'
+                : 'bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-600'}">${esc(t.label)}</button>`;
+            }).join('')}
+          </div>
+        </div>
       </div>
-      <div class="space-y-3">${users.length ? users.map(renderPlatformUser).join('') :
-        '<div class="bg-white dark:bg-slate-800 rounded-xl p-5 text-sm text-slate-500">এখনো কোনো Platform user request নেই।</div>'}</div>`;
+      <div class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden">
+        <div class="overflow-x-auto">
+          <table class="w-full text-left border-collapse">
+            <thead>
+              <tr class="border-b border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900/40 text-xs text-slate-500">
+                <th class="py-3 px-4 font-semibold">ইউজার</th>
+                <th class="py-3 px-4 font-semibold">স্ট্যাটাস</th>
+                <th class="py-3 px-4 font-semibold text-right">অ্যাকশন</th>
+              </tr>
+            </thead>
+            <tbody class="divide-y divide-slate-100 dark:divide-slate-700/70">
+              ${filteredUsers.length ? filteredUsers.map(renderPlatformUserRow).join('') :
+                `<tr><td colspan="3" class="py-8 px-4 text-center text-sm text-slate-500">এই ফিল্টারে কোনো Platform user নেই।</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+      </div>`;
   } catch (err) {
     c.innerHTML = `<div class="bg-red-50 text-red-700 rounded-xl p-5">Platform users লোড ব্যর্থ: ${esc(humanizeError(err))}</div>`;
   }
 }
 
-function renderPlatformUser(user) {
+function renderPlatformUserRow(user) {
   const access = platformAccessState(user);
-  const statusLabel = {
+  const statusText = {
     pending: 'অনুমোদনের অপেক্ষায়',
-    active: access.active ? 'সক্রিয় ও পরিশোধিত' : 'সক্রিয় — পেমেন্ট/মেয়াদ প্রয়োজন',
-    past_due: 'পেমেন্ট বকেয়া / মেয়াদ শেষ',
+    active: access.active ? 'সক্রিয় ও পরিশোধিত' : 'সক্রিয় — অনুমোদন / পেমেন্ট প্রয়োজন',
+    past_due: 'মেয়াদ শেষ / পেমেন্ট বকেয়া',
     unpaid: 'সেটআপ ফি বকেয়া',
     revoked: 'বাতিল / স্থগিত',
   }[access.status] || esc(access.status || 'pending');
+
   const expiry = user.validUntil
     ? new Date(dateValue(user.validUntil)).toLocaleDateString('bn-BD')
     : 'সেট করা নেই';
   const history = Array.isArray(user.paymentHistory) ? user.paymentHistory : [];
-  return `<article class="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5">
-    <div class="flex flex-wrap justify-between gap-3">
-      <div>
-        <h4 class="font-semibold">${esc(user.displayName || user.email || user.uid)}</h4>
-        <p class="text-xs text-slate-500">${esc(user.email || '')} · UID: <code>${esc(user.uid)}</code></p>
+
+  return `<tr class="align-top hover:bg-slate-50/80 dark:hover:bg-slate-700/30 transition">
+    <td class="py-3.5 px-4">
+      <div class="font-semibold text-sm text-slate-800 dark:text-slate-100">${esc(user.displayName || user.email || user.uid)}</div>
+      <div class="text-xs text-slate-500">${esc(user.email || '')}</div>
+      <div class="text-[11px] text-slate-400 mt-0.5">UID: <code>${esc(user.uid)}</code>${user.byokProjectId ? ` · BYOK: <code>${esc(user.byokProjectId)}</code>` : ''}</div>
+      ${user.revocationNote ? `<div class="text-xs text-red-600 mt-1">নোট: ${esc(user.revocationNote)}</div>` : ''}
+    </td>
+    <td class="py-3.5 px-4 text-xs">
+      <span class="inline-block rounded-full px-2.5 py-0.5 font-medium ${access.active ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-800'}">${esc(statusText)}</span>
+      <div class="text-slate-600 dark:text-slate-300 mt-1.5">Setup: <strong>${user.setupFeePaid === true ? 'Paid' : 'Due'}</strong> (${access.setupFee.toLocaleString('en-US')}) · Add-on: <strong>${user.storeSetupAssistance === true ? '+৳৫,০০০' : 'না'}</strong></div>
+      <div class="text-slate-500 mt-0.5">বৈধতা: <strong>${esc(expiry)}</strong> · পেমেন্ট: ${history.length}টি</div>
+    </td>
+    <td class="py-3.5 px-4 text-right">
+      <div class="flex flex-wrap justify-end items-center gap-1.5">
+        <input id="monthly-payment-note-${esc(user.uid)}" class="border border-slate-300 dark:border-slate-600 rounded px-2 py-1 text-xs w-28 bg-white dark:bg-slate-700" placeholder="পেমেন্ট নোট"/>
+        <button type="button" onclick="recordPlatformMonthlyPayment('${esc(user.uid)}')" class="btn btn-brand-outline btn-sm">১ মাস</button>
+        <button type="button" onclick="approvePlatformUser('${esc(user.uid)}')" class="btn btn-primary btn-sm">Approve</button>
+        <button type="button" onclick="revokePlatformUser('${esc(user.uid)}')" class="btn btn-danger-outline btn-sm">Revoke</button>
       </div>
-      <span class="text-xs rounded-full px-3 py-1 ${access.active ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-800'}">${esc(statusLabel)}</span>
-    </div>
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs mt-4">
-      <div>সেটআপ ফি: <strong>৳${user.setupFeePaid === true ? 'পরিশোধিত' : 'বকেয়া'} (${access.setupFee.toLocaleString('en-US')})</strong></div>
-      <div>Store setup: <strong>${user.storeSetupAssistance === true ? '+৳৫,০০০' : 'বন্ধ'}</strong></div>
-      <div>বৈধতা: <strong>${esc(expiry)}</strong></div>
-      <div>মাসিক ফি: <strong>৳১,৫০০</strong></div>
-    </div>
-    ${user.revocationNote ? `<p class="text-xs text-red-600 mt-2">স্থগিতের নোট: ${esc(user.revocationNote)}</p>` : ''}
-    <div class="flex flex-wrap gap-2 mt-4">
-      <button onclick="approvePlatformUser('${esc(user.uid)}')" class="btn btn-primary btn-sm">Approve / Accept</button>
-      <button onclick="revokePlatformUser('${esc(user.uid)}')" class="btn btn-danger-outline btn-sm">Revoke / Suspend</button>
-      <button onclick="togglePlatformStoreSetup('${esc(user.uid)}', ${user.storeSetupAssistance === true})" class="btn btn-secondary btn-sm">${user.storeSetupAssistance === true ? '৳৫,০০০ add-on বন্ধ' : '+৳৫,০০০ add-on চালু'}</button>
-      <button onclick="setPlatformSetupFeePaid('${esc(user.uid)}', ${user.setupFeePaid === true})" class="btn btn-secondary btn-sm">Setup fee ${user.setupFeePaid === true ? 'unpaid করুন' : 'paid চিহ্নিত করুন'}</button>
-      <input id="monthly-payment-note-${esc(user.uid)}" class="border rounded px-2 py-1 text-xs" placeholder="মাসিক পেমেন্ট reference / note"/>
-      <button onclick="recordPlatformMonthlyPayment('${esc(user.uid)}')" class="btn btn-brand-outline btn-sm">৳১,৫০০ payment record</button>
-    </div>
-    <p class="text-[11px] text-slate-400 mt-3">Payment history (${history.length}): ${history.slice(-3).map(item =>
-      `${new Date(dateValue(item.paidAt)).toLocaleDateString('bn-BD')} · ৳${Number(item.amount || 0).toLocaleString('en-US')}${item.note ? ` · ${esc(item.note)}` : ''}`
-    ).join(' | ') || 'কোনো payment নেই'}</p>
-  </article>`;
+      <div class="flex flex-wrap justify-end gap-1.5 mt-1.5">
+        <button type="button" onclick="setPlatformSetupFeePaid('${esc(user.uid)}', ${user.setupFeePaid === true})" class="btn btn-secondary btn-sm">${user.setupFeePaid === true ? 'Setup Unpaid' : 'Setup Paid'}</button>
+        <button type="button" onclick="togglePlatformStoreSetup('${esc(user.uid)}', ${user.storeSetupAssistance === true})" class="btn btn-secondary btn-sm">${user.storeSetupAssistance === true ? 'Add-on বন্ধ' : '+৳৫,০০০ Add-on'}</button>
+      </div>
+    </td>
+  </tr>`;
 }
 
 function dateValue(value) {
@@ -124,19 +182,20 @@ async function approvePlatformUser(uid) {
       email: String(user.email || '').toLowerCase(),
       displayName: user.displayName || '',
       role: 'owner',
-      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      approvedAt: firebase.firestore.FieldValue.serverTimestamp(),
+      approvedBy: APP_STATE.currentUser.uid,
     }, { merge: true });
     await batch.commit();
-    toast('Owner অনুমোদিত হয়েছে। Setup fee paid ও monthly validity না থাকলে core access বন্ধ থাকবে।', 's');
+    toast('Platform user অনুমোদিত হয়েছে।', 's');
     await renderAdminModule();
   } catch (err) {
-    toast('Approval ব্যর্থ: ' + humanizeError(err), 'e');
+    toast('অনুমোদন ব্যর্থ: ' + humanizeError(err), 'e');
   }
 }
 
 async function revokePlatformUser(uid) {
   if (requireSuperAdmin()) return;
-  const note = prompt('Revoke/Suspend করার কারণ লিখুন:');
+  const note = prompt('স্থগিত বা বাতিল করার কারণ লিখুন:', '');
   if (note === null) return;
   if (!note.trim()) return toast('Suspend note লিখুন।', 'w');
   if (await updatePlatformUser(uid, {
@@ -185,8 +244,7 @@ async function setPlatformSetupFeePaid(uid, currentlyPaid) {
         amount: PLATFORM_BILLING.setupFee +
           (user.storeSetupAssistance === true ? PLATFORM_BILLING.storeSetupFee : 0),
         type: 'setup',
-        paidAt: new Date(),
-        note: 'Setup fee payment marked by Super Admin',
+        paidAt: new Date().toISOString(),
         recordedBy: APP_STATE.currentUser.uid,
       });
     }
@@ -213,17 +271,17 @@ async function recordPlatformMonthlyPayment(uid) {
         validUntil: firebase.firestore.Timestamp.fromDate(validUntil),
         paymentHistory: firebase.firestore.FieldValue.arrayUnion({
           amount: PLATFORM_BILLING.monthlyFee,
-          paidAt: new Date(now),
-          validUntil,
+          type: 'monthly',
           note,
+          paidAt: new Date().toISOString(),
           recordedBy: APP_STATE.currentUser.uid,
         }),
         updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       });
     });
-    toast('৳১,৫০০ payment record হয়েছে; এক মাস validity যোগ হয়েছে।', 's');
+    toast('১ মাসের (৳১,৫০০) পেমেন্ট রেকর্ড হয়েছে।', 's');
     await renderAdminModule();
   } catch (err) {
-    toast('মাসিক payment record ব্যর্থ: ' + humanizeError(err), 'e');
+    toast('মাসিক পেমেন্ট রেকর্ড ব্যর্থ: ' + humanizeError(err), 'e');
   }
 }

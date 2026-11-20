@@ -439,10 +439,41 @@ async function testFirebaseByokConfig() {
   }
 }
 
-function saveFirebaseByokConfigForm() {
+async function saveFirebaseByokConfigForm() {
   if (requireFirebaseSetupOwner()) return;
   try {
-    saveFirebaseByokConfig(readFirebaseByokForm());
+    const saved = saveFirebaseByokConfig(readFirebaseByokForm());
+    const authUser = (typeof fbAuth !== 'undefined' && fbAuth?.currentUser) || APP_STATE?.currentUser;
+    if (typeof fbDb !== 'undefined' && fbDb && authUser?.uid) {
+      try {
+        const ref = fbDb.collection('platformUsers').doc(authUser.uid);
+        const snap = await ref.get();
+        const byokFields = {
+          byokProjectId: saved.projectId,
+          byokUpdatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        };
+        if (!snap.exists) {
+          await ref.set({
+            uid: authUser.uid,
+            email: String(authUser.email || '').toLowerCase(),
+            displayName: authUser.displayName || '',
+            status: 'pending',
+            setupFeePaid: false,
+            storeSetupAssistance: false,
+            validUntil: null,
+            createdAt: firebase.firestore.FieldValue.serverTimestamp(),
+            ...byokFields,
+          });
+        } else {
+          await ref.update(byokFields);
+        }
+        setFirebaseByokStatus('কনফিগ সেভ হয়েছে এবং Super Admin অনুমোদনের জন্য রিকোয়েস্ট পাঠানো হয়েছে (active billing ছাড়া কার্যকর হবে না)।', 'w');
+        return;
+      } catch (syncErr) {
+        setFirebaseByokStatus('কনফিগ এই ডিভাইসে সেভ হয়েছে; তবে Platform রিকোয়েস্ট সিঙ্কে সমস্যা: ' + humanizeError(syncErr), 'w');
+        return;
+      }
+    }
     setFirebaseByokStatus('কনফিগ এই ডিভাইসে সেভ হয়েছে; Super Admin অনুমোদন ও active billing না হওয়া পর্যন্ত pending থাকবে।', 'w');
   } catch (err) {
     setFirebaseByokStatus(humanizeError(err), 'e');

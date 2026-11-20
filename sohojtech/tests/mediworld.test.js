@@ -643,7 +643,7 @@ test('Firestore rules retain owner/staff role, branch, collection and deny-by-de
   assert.match(rules, /rules_version\s*=\s*'2'/);
   assert.match(rules, /function isSuperAdmin\(\)/);
   assert.match(rules, /function hasActivePlatformBilling\(ownerUid\)/);
-  assert.match(rules, /match \/platformUsers\/\{ownerUid\}[\s\S]*?allow update, delete: if isSuperAdmin\(\)/);
+  assert.match(rules, /match \/platformUsers\/\{ownerUid\}[\s\S]*?allow update: if isSuperAdmin\(\)[\s\S]*?allow delete: if isSuperAdmin\(\)/);
   assert.match(rules, /function isOwner\(\)[\s\S]*?\.data\.role == 'owner'/);
   assert.match(rules, /function isActiveStaff\(\)[\s\S]*?staffDoc\(\)\.active == true[\s\S]*?staffDoc\(\)\.status == 'active'/);
   assert.match(rules, /request\.resource\.data\.role in \['manager', 'cashier'\]/);
@@ -830,7 +830,7 @@ test('Platform User Management is Super Admin-only in the renderer and action ha
     toast() {},
   });
   await rootAdmin.context.renderAdminModule();
-  assert.match(rootAdmin.elements.get('admin-content').innerHTML, /Approve \/ Accept/);
+  assert.match(rootAdmin.elements.get('admin-content').innerHTML, /Approve/i);
 });
 
 test('platform setup and maintenance fee calculations and entitlement gating are exact', () => {

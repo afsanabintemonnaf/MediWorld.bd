@@ -205,9 +205,16 @@ service cloud.firestore {
         && request.resource.data.storeSetupAssistance == false
         && request.resource.data.keys().hasOnly([
           'uid', 'email', 'displayName', 'status', 'setupFeePaid',
-          'storeSetupAssistance', 'validUntil', 'createdAt'
-        ]);
-      allow update, delete: if isSuperAdmin();
+          'storeSetupAssistance', 'validUntil', 'createdAt',
+          'byokProjectId', 'byokUpdatedAt'
+        ])
+        && (!('byokProjectId' in request.resource.data) || request.resource.data.byokProjectId is string);
+      allow update: if isSuperAdmin()
+        || (signedIn()
+          && ownerUid == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['byokProjectId', 'byokUpdatedAt'])
+          && request.resource.data.byokProjectId is string);
+      allow delete: if isSuperAdmin();
     }
 
     match /branches/{branchId} {
